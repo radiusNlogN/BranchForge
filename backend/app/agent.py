@@ -345,14 +345,14 @@ def _check_context(
 
     limit = config.agent_max_input_tokens
     if counted > limit:
+        # Name the ceiling that actually bound, so the message stays true whether
+        # the application limit or the model's capacity is the smaller one.
         raise AgentFailure(
             "context_budget_exceeded",
             f"The conversation would send {counted:,} input tokens, over the "
-            f"{limit:,}-token budget (model context {config.agent_model_context_tokens:,} "
-            f"less {config.agent_max_output_tokens:,} reserved for output and "
-            f"{config.agent_context_safety_margin_tokens:,} safety margin). Stopping "
-            f"rather than discarding conversation history; context compaction is not "
-            f"implemented.",
+            f"{limit:,}-token budget set by {config.agent_context_limit_reason}. "
+            f"Stopping rather than discarding conversation history; context "
+            f"compaction is not implemented.",
         )
     record("context_measured", f"Context: {counted:,} of {limit:,} input tokens", None)
 

@@ -19,10 +19,14 @@ from app.models import (
     RUN_STATUS_INSPECTING,
     RUN_STATUS_PENDING,
     RUN_STATUS_READY,
+    VERIFY_STATUS_COMPLETED,
+    VERIFY_STATUS_FAILED,
+    VERIFY_STATUS_RUNNING,
     AttemptEvent,
     Inspection,
     PatchAttempt,
     Run,
+    Verification,
 )
 from app.time_utils import utcnow
 
@@ -299,3 +303,126 @@ def save_attempt_failure(
     db.commit()
     db.refresh(attempt)
     return attempt
+
+
+# --- Verification (milestone 4) ---------------------------------------------
+# None of these functions touch Run.status or PatchAttempt.status. A run stays
+# `ready` and an attempt stays `succeeded` no matter what a verification finds:
+# those statuses describe inspection and proposal, not whether the patch works.
+
+
+def get_verification_for_attempt(db: Session, attempt_id: str) -> Verification | None:
+    return db.execute(
+        select(Verification).where(Verification.attempt_id == attempt_id)
+    ).scalar_one_or_none()
+
+
+def get_verification_for_run(db: Session, run_id: str) -> Verification | None:
+    """Fetch the verification belonging to a run's patch attempt, if any."""
+    return db.execute(
+        select(Verification)
+        .join(PatchAttempt, Verification.attempt_id == PatchAttempt.id)
+        .where(PatchAttempt.run_id == run_id)
+    ).scalar_one_or_none()
+
+
+def claim_verification(
+    db: Session,
+    *,
+    attempt_id: str,
+    commit_sha: str | None,
+    patch_sha256: str,
+    profile: str,
+    image_ref: str,
+    image_id: str,
+) -> Verification | None:
+    """Atomically claim the one verification slot for this attempt.
+
+    `verifications.attempt_id` is UNIQUE, so the INSERT itself is the claim: a
+    second worker gets an IntegrityError and returns None having started no
+    container and downloaded no source. Committed before any expensive work.
+    """
+    verification = Verification(
+        attempt_id=attempt_id,
+        status=VERIFY_STATUS_RUNNING,
+        commit_sha=commit_sha,
+        patch_sha256=patch_sha256,
+        profile=profile,
+        image_ref=image_ref,
+        image_id=image_id,
+    )
+    db.add(verification)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return None
+    db.refresh(verification)
+    return verification
+
+
+def save_verification_result(
+    db: Session,
+    *,
+    verification_id: str,
+    outcome: str,
+    detail: str,
+    patch_applied: bool,
+    patch_apply_message: str,
+    patch_touched_tests: bool,
+    files_changed: list[str],
+    runner_args: list[str],
+    baseline_summary: dict[str, Any] | None,
+    patched_summary: dict[str, Any] | None,
+    comparison: dict[str, Any] | None,
+    baseline_log: str,
+    patched_log: str,
+    supplemental_summary: dict[str, Any] | None,
+    supplemental_log: str,
+    notes: list[str],
+    max_log_chars: int,
+    max_error_chars: int,
+) -> None:
+    """Store a completed verification: outcome and evidence in one commit."""
+    verification = db.get(Verification, verification_id)
+    if verification is None:  # pragma: no cover - defensive
+        return
+
+    verification.status = VERIFY_STATUS_COMPLETED
+    verification.outcome = outcome
+    verification.detail = detail[:max_error_chars]
+    verification.patch_applied = patch_applied
+    verification.patch_apply_message = patch_apply_message[:max_error_chars]
+    verification.patch_touched_tests = patch_touched_tests
+    verification.files_changed = files_changed
+    verification.runner_args = runner_args
+    verification.baseline_summary = baseline_summary
+    verification.patched_summary = patched_summary
+    verification.comparison = comparison
+    verification.baseline_log = baseline_log[:max_log_chars]
+    verification.patched_log = patched_log[:max_log_chars]
+    verification.supplemental_summary = supplemental_summary
+    verification.supplemental_log = supplemental_log[:max_log_chars]
+    verification.notes = notes
+    verification.completed_at = utcnow()
+    db.commit()
+
+
+def save_verification_failure(
+    db: Session,
+    *,
+    verification_id: str,
+    error_kind: str,
+    error_message: str,
+    max_error_chars: int,
+) -> None:
+    """Record that the verification itself could not run."""
+    verification = db.get(Verification, verification_id)
+    if verification is None:  # pragma: no cover - defensive
+        return
+
+    verification.status = VERIFY_STATUS_FAILED
+    verification.error_kind = error_kind[:50]
+    verification.error_message = error_message[:max_error_chars]
+    verification.completed_at = utcnow()
+    db.commit()

@@ -18,6 +18,7 @@ from app.schemas import (
     PatchAttemptRead,
     RunCreate,
     RunDetailRead,
+    VerificationRead,
     RunRead,
 )
 
@@ -61,9 +62,9 @@ def get_run(
     run_id: str = Path(description="Server-generated run UUID."),
     db: Session = Depends(get_db),
 ) -> RunDetailRead:
-    """Return one run with its inspection and patch attempt, or 404 if unknown.
+    """Return one run with its inspection, attempt, and verification, or 404.
 
-    Both are `null` until the corresponding worker command has run. The response
+    Each is `null` until the corresponding worker command has run. The response
     stays bounded because the workers' budgets bound what they write, and the
     attempt's event list is capped here as well.
     """
@@ -90,5 +91,9 @@ def get_run(
             AttemptEventRead.model_validate(event) for event in events
         ]
         detail.patch_attempt.events_total = repository.count_attempt_events(db, attempt.id)
+
+        verification = repository.get_verification_for_attempt(db, attempt.id)
+        if verification is not None:
+            detail.verification = VerificationRead.model_validate(verification)
 
     return detail

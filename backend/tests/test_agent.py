@@ -554,3 +554,58 @@ def test_events_never_contain_model_reasoning(ready_run, session_factory):
     _, events, _ = attempt_of(session_factory, ready_run)
     blob = " ".join(f"{k} {s}" for _, k, s in events)
     assert "CHAIN OF THOUGHT" not in blob
+
+
+def test_application_context_limit_binds_when_it_is_the_smaller_ceiling(
+    ready_run, session_factory
+):
+    """The explicit application limit must survive a huge model context window.
+
+    Swapping in a model with a larger window must not silently licence a larger
+    attempt: the effective budget is min(app limit, model headroom).
+    """
+    config = agent_settings(
+        agent_max_context_tokens=1_000,
+        agent_model_context_tokens=1_000_000,
+        agent_max_output_tokens=100,
+        agent_context_safety_margin_tokens=100,
+    )  # model headroom = 999,800, application limit = 1,000 -> 1,000 wins
+    assert config.agent_max_input_tokens == 1_000
+
+    model = ScriptedModelClient([make_turn(tool_calls=[submit_call()])], token_count=5_000)
+    assert (
+        propose(ready_run, session_factory, model, FakeGitHub(), config)
+        == worker.EXIT_ATTEMPT_FAILED
+    )
+
+    attempt, _, _ = attempt_of(session_factory, ready_run)
+    assert attempt.error_kind == "context_budget_exceeded"
+    # The message must blame the ceiling that actually bound.
+    assert "AGENT_MAX_CONTEXT_TOKENS" in attempt.error_message
+    assert "1,000-token budget" in attempt.error_message
+    assert model.calls == 0
+
+
+def test_model_headroom_binds_when_the_application_limit_is_higher(
+    ready_run, session_factory
+):
+    """With the application limit raised above capacity, the model's window binds."""
+    config = agent_settings(
+        agent_max_context_tokens=10_000_000,
+        agent_model_context_tokens=1_000,
+        agent_max_output_tokens=100,
+        agent_context_safety_margin_tokens=100,
+    )  # model headroom = 800 -> 800 wins
+    assert config.agent_max_input_tokens == 800
+
+    model = ScriptedModelClient([make_turn(tool_calls=[submit_call()])], token_count=5_000)
+    assert (
+        propose(ready_run, session_factory, model, FakeGitHub(), config)
+        == worker.EXIT_ATTEMPT_FAILED
+    )
+
+    attempt, _, _ = attempt_of(session_factory, ready_run)
+    assert attempt.error_kind == "context_budget_exceeded"
+    assert "model's capacity" in attempt.error_message
+    assert "AGENT_MAX_CONTEXT_TOKENS" not in attempt.error_message
+    assert model.calls == 0

@@ -28,6 +28,10 @@ RUN_STATUS_FAILED = "failed"
 
 # Patch-attempt lifecycle. Deliberately SEPARATE from the run status: a run stays
 # `ready` (meaning inspection succeeded) whether an attempt succeeds or fails.
+VERIFY_STATUS_RUNNING = "running"
+VERIFY_STATUS_COMPLETED = "completed"
+VERIFY_STATUS_FAILED = "failed"
+
 ATTEMPT_STATUS_RUNNING = "running"
 ATTEMPT_STATUS_SUCCEEDED = "succeeded"
 ATTEMPT_STATUS_FAILED = "failed"
@@ -181,6 +185,9 @@ class PatchAttempt(Base):
     )
 
     run: Mapped["Run"] = relationship(back_populates="patch_attempt")
+    verification: Mapped["Verification | None"] = relationship(
+        back_populates="attempt", cascade="all, delete-orphan", uselist=False
+    )
     events: Mapped[list["AttemptEvent"]] = relationship(
         back_populates="attempt",
         cascade="all, delete-orphan",
@@ -222,3 +229,76 @@ class AttemptEvent(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<AttemptEvent seq={self.seq} kind={self.kind!r}>"
+
+
+class Verification(Base):
+    """One execution of a proposed patch against the repository's own tests.
+
+    `status` says whether the verification itself ran; `outcome` says what it
+    found. They are separate on purpose — "the verification completed" and "the
+    patch fixes the bug" are different claims, and collapsing them into one field
+    is how a green badge starts meaning nothing.
+
+    One verification per patch attempt: `attempt_id` is UNIQUE, so inserting the
+    row *is* the atomic claim.
+    """
+
+    __tablename__ = "verifications"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    attempt_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("patch_attempts.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=VERIFY_STATUS_RUNNING,
+        server_default=VERIFY_STATUS_RUNNING,
+    )
+    outcome: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Exactly what was verified, so a result can be reproduced or disbelieved.
+    commit_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    patch_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    profile: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    image_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    image_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    runner_args: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    patch_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    patch_apply_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    patch_touched_tests: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    files_changed: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    baseline_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    patched_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    comparison: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    baseline_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    patched_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Supplemental evidence lives in its own columns. A supplemental failure or
+    # timeout must never overwrite the baseline-versus-patched result.
+    supplemental_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    supplemental_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    notes: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    attempt: Mapped["PatchAttempt"] = relationship(back_populates="verification")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Verification attempt_id={self.attempt_id!r} outcome={self.outcome!r}>"

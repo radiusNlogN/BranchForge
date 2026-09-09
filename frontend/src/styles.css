@@ -1093,3 +1093,109 @@ textarea:disabled {
   }
   .events__detail { grid-column: 1; }
 }
+
+/* --- Verification panel (milestone 4) ------------------------------------ */
+/* There is deliberately no "verified" badge style: the outcome is stated in
+   words, and only two of the outcome values are styled as good news. */
+
+.badge--verify-running {
+  color: var(--inspecting);
+  border-color: color-mix(in srgb, var(--inspecting) 35%, transparent);
+}
+
+.badge--verify-completed {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--text) 25%, transparent);
+}
+
+.badge--verify-failed {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+.verify__outcome {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border-left: 3px solid var(--border);
+  background: var(--surface-2);
+}
+
+.verify__outcome strong { display: block; margin-bottom: 4px; }
+.verify__outcome p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+.verify__outcome--good {
+  border-left-color: var(--ready);
+  background: color-mix(in srgb, var(--ready) 8%, var(--surface-2));
+}
+
+.verify__outcome--bad {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface-2));
+}
+
+.verify__outcome--neutral { border-left-color: var(--muted); }
+
+.verify__scope {
+  color: var(--muted);
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+
+.verify__runs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin: 14px 0;
+}
+
+.verify__run {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  min-width: 0;
+}
+
+.verify__run h4 { margin: 0 0 6px; font-size: 0.86rem; }
+
+.verify__counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.verify__counts div { display: flex; gap: 4px; align-items: baseline; }
+.verify__counts dt { color: var(--muted); font-size: 0.78rem; }
+.verify__counts dd { margin: 0; font-variant-numeric: tabular-nums; font-weight: 600; }
+
+.verify__ids { margin: 12px 0; }
+.verify__ids h5 { margin: 0 0 4px; font-size: 0.82rem; }
+.verify__ids ul { margin: 0; padding-left: 18px; }
+.verify__ids li { font-size: 0.8rem; }
+.verify__ids code { word-break: break-all; }
+
+.callout--warn {
+  border-color: color-mix(in srgb, var(--inspecting) 40%, transparent);
+  background: color-mix(in srgb, var(--inspecting) 8%, var(--surface-2));
+}
+
+.warn { color: var(--danger); }
+
+/* Container output is untrusted program text: plain, scrollable, wrapped. */
+.log { margin: 10px 0; }
+.log summary { cursor: pointer; font-size: 0.85rem; }
+
+.log__body {
+  margin: 8px 0 0;
+  padding: 10px;
+  background: var(--surface-3, var(--surface-2));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 320px;
+  overflow: auto;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

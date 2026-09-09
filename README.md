@@ -3,15 +3,19 @@
 BranchForge investigates GitHub issues by running competing agent-generated fixes in isolated
 environments and presenting verified patches.
 
-**This repository currently contains milestones 1-3: run intake, read-only repository inspection,
-and one bounded patch-proposal agent.** A run is stored as `pending`; one worker command inspects the
-repository through the GitHub API (`ready`/`failed`); a second runs a single agent that reads the
-issue and the inspection, requests further files, and proposes a patch.
+**This repository currently contains milestones 1-4: run intake, read-only repository inspection,
+one bounded patch-proposal agent, and containerised verification of the proposed patch.** A run is
+stored as `pending`; one worker command inspects the repository through the GitHub API
+(`ready`/`failed`); a second runs a single agent that proposes a patch; a third applies that patch to
+a throwaway copy of the exact inspected commit and runs the repository's own tests before and after,
+inside a container with no network access.
 
-**Any proposed patch is unverified.** It is checked only for valid unified-diff syntax. BranchForge
-never applies it, compiles it, or runs tests, and never clones the repository or executes repository
-code. Competing parallel attempts and sandboxed verification are not implemented. Nothing is
-scheduled automatically and no progress or results are simulated.
+**A verification result is not a proof of correctness.** It reports how the tests that actually ran
+behaved, on one commit, in one fixed runner profile. Repository dependencies are never installed and
+no repository setup script is ever run, so a project needing more than the profile provides is
+reported as an *environment limitation* rather than as a failing patch. Competing parallel attempts,
+retries, and scheduling are not implemented, nothing is scheduled automatically, and no progress or
+results are simulated.
 
 ---
 
@@ -26,6 +30,7 @@ scheduled automatically and no progress or results are simulated.
 - [API](#api)
 - [GitHub rate limits](#github-rate-limits)
 - [Model configuration and budgets](#model-configuration-and-budgets)
+- [Verification: the runner and what a result means](#verification-the-runner-and-what-a-result-means)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 - [Design notes](#design-notes)
@@ -55,10 +60,25 @@ scheduled automatically and no progress or results are simulated.
   submission is returned to the model as a tool error so it can correct itself within its budgets.
 - Attempt activity is stored as ordered events and shown in the dashboard beside the diff, under a
   prominent "unverified" label.
+- A third worker command verifies that patch for real: it downloads the source archive of the exact
+  inspected commit, runs the repository's own pytest suite to get a baseline, applies the patch to a
+  separate copy, and runs the same original tests again — every test executing inside a disposable
+  container with no network, a non-root user, a read-only source mount, and CPU/memory/PID/wall-clock
+  ceilings.
+- The comparison is made on explicit per-test outcomes, so a previously failing test counts as fixed
+  only when that same test **passes** afterwards; skipped, xfailed, deselected, and uncollected are
+  recorded as *not fixed*.
+- The original tests, `conftest.py` files, fixture data, and collection configuration are restored
+  over the patched source before the comparison, and any test file the patch *added* is removed — so
+  a patch cannot alter the yardstick it is measured against. Tests the patch adds run separately as
+  labelled supplemental evidence.
+- The dashboard shows the baseline and patched results side by side, the patch-application status,
+  which tests changed state, collapsible container logs, and the exact runner command — with the
+  outcome stated in words rather than as a "verified" badge.
 
 ## The workflow
 
-Three steps. Nothing is automatic — you run the worker yourself.
+Four steps. Nothing is automatic — you run the worker yourself.
 
 ```bash
 # 1. Create a run (dashboard at http://localhost:5173, or the API directly)
@@ -76,8 +96,54 @@ uv run python -m app.worker inspect --run-id 64fbb850-784e-44fa-8c73-9e0dce94c33
 # 3. Propose a patch (needs ANTHROPIC_API_KEY)
 uv run python -m app.worker propose --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
 
-# 4. Refresh the run's detail view in the dashboard (or GET /api/runs/<id>)
+# 4. Verify it (needs Docker and the runner image — see below)
+uv run python -m app.worker verify --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
+
+# 5. Refresh the run's detail view in the dashboard (or GET /api/runs/<id>)
 ```
+
+Each step happens at most once per run. `verify` exits `0` whenever the verification *ran* — including
+when its finding is "the patch does not fix anything". A non-zero exit means the verification itself
+could not be carried out.
+
+Building the runner image once, before the first `verify`:
+
+```bash
+docker build --provenance=false -t branchforge-runner-python:1 backend/runner/python-pytest
+```
+
+(`--provenance=false` keeps it a plain single-platform image; buildx otherwise adds attestation
+manifests that Docker Desktop's containerd store cannot always `inspect`.)
+
+Real output from a `verify` run against a real repository, with a patch that breaks an import:
+
+```
+Claimed verification for run 603fe439-0920-4c50-9f00-9895fb33042c
+Profile: python-pytest | image branchforge-runner-python:1 (sha256:9929aa2db795)
+Commit: c8e394065cd541a16c040515dc0afb85cf22a7c3
+Repository code runs only inside a disposable container with no network.
+  · Fetching source for commit c8e394065cd5
+  · Snapshot: 16 files at c8e394065cd5
+  · Running the original test suite (baseline)
+  · Baseline: ok (0 failing of 200 collected)
+  · Patch applied to 1 file(s)
+  · Running the original tests against the patched source
+  · Patched: collection_error (0 failing of 0 collected)
+
+Outcome: patched_collection_error
+  The baseline collected successfully but the patched source did not. The patch breaks import or
+  collection.
+  baseline: ok — 0 failing of 200 collected
+  patched : collection_error — 0 failing of 0 collected
+
+This covers only the tests that ran, on this commit, in this runner profile. It is not proof the
+patch is correct.
+```
+
+Note what that example does *not* say. The patch emptied the set of failing tests, because nothing
+could be imported at all. Reporting that as an improvement is the single most tempting mistake a
+patch verifier can make, so a patched-only collection failure has its own outcome and is never
+counted as progress.
 
 The worker prints what it did:
 
@@ -127,6 +193,7 @@ UNVERIFIED: the patch was not applied and no tests were run.
 | Python | 3.11.0 | `requires-python = ">=3.11"`; uv selects an interpreter for you |
 | Node.js | 20.10.0 | See the note below |
 | npm | 10.2.3 | Ships with Node |
+| Docker | 27.4.0 | Only for `worker verify`; everything else runs without it |
 
 > **Note on the Vite version.** The frontend pins the Vite 6 line (`vite@^6.4.3`) rather than the
 > latest major. Vite 7+ and `@vitejs/plugin-react` 5+ require Node `^20.19.0 || >=22.12.0`, which
@@ -187,13 +254,19 @@ resolves against the directory you launch from.
 
 ```bash
 cd backend
-uv run pytest
+uv run pytest                      # everything, including real Docker runs
+uv run pytest -m "not docker"      # offline only, no daemon needed
+uv run pytest -m docker            # only the real container scenarios
 ```
 
 Each test runs against its own temporary SQLite database, built by running the **real Alembic
 migration** rather than `create_all`, so a broken migration fails the suite. Coverage includes the
 create/retrieve round trip, URL and description validation, attempt bounds, 404s, list ordering and
 limits, UTC timestamp round-tripping, and migration upgrade/downgrade.
+
+Tests marked `docker` build real containers and skip automatically when the daemon or the runner
+image is missing — they are never silently faked. Everything else runs offline: GitHub is mocked at
+the transport layer, the model at the interface layer, and the container runner is injected.
 
 ### Frontend type check and production build
 
@@ -222,6 +295,45 @@ duplicate submissions, `max_tokens` truncation rejected before tool calls run, i
 corrected within budget, every budget being exhausted, context-budget termination, provider and
 token-counting failures, completion without a patch, concurrent claims permitting exactly one model
 caller, and a synthetic-sentinel credential never reaching the database or the API.
+
+### Verification tests
+
+```bash
+cd backend
+uv run pytest tests/test_snapshot.py       # archive extraction hardening (offline)
+uv run pytest tests/test_runner_argv.py    # the docker argv, no daemon required
+uv run pytest tests/test_verification.py   # comparison logic and orchestration (offline)
+uv run pytest tests/test_verify_worker.py  # the worker command and claim contention
+uv run pytest tests/test_docker_runner.py  # REAL containers (skips without Docker)
+```
+
+`tests/test_runner_argv.py` asserts the isolation flags directly — `--network=none`, `--user`,
+`--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, the memory/CPU/PID ceilings —
+and, negatively, that the argument vector carries no credential, no `docker.sock`, no host home
+directory, no database file, and exactly one mount of the source tree. Those assertions hold whether
+or not Docker is installed, which is why they exist separately from the live runs.
+
+`tests/test_docker_runner.py` proves the flags actually take effect: a test inside the container
+asserts `os.getuid() == 65534`, that writing to `/workspace` fails, and that opening a socket fails.
+It also drives the deterministic fixture in `tests/sample_repo/` through every scenario — a correct
+patch, a patch that does not apply, an incorrect patch that causes regressions, an ineffective patch,
+a patch deleting the failing test, a patch that makes the failing test skip itself from source, a
+patch that changes which tests are collected, a patch that breaks import, a hanging test (asserting
+the container is force-removed and nothing is left behind), and a test flooding stdout (asserting the
+log is capped without the run stalling).
+
+The fixture repository under `backend/tests/sample_repo/` contains a deliberately failing test. It is
+excluded from our own suite via `collect_ignore_glob` in `tests/conftest.py` — otherwise it would fail
+the run it is meant to support.
+
+### Live verification check (optional — uses your GitHub rate limit, no API credit)
+
+Verification needs no model call: a deterministic patch is better evidence than a generated one. To
+exercise the real snapshot download and real containers end to end against a public repository, create
+a run, inspect it, store a patch, and verify — see the workflow section above. A live check performed
+this way against `benjaminp/six` produced a 16-file snapshot, ran the repository's 200-test suite in a
+container (185 passed, 15 skipped), and reported `no_bug_demonstrated` for a comment-only patch and
+`patched_collection_error` for a patch that broke an import.
 
 ### Live agent smoke test (optional — spends money and GitHub rate limit)
 
@@ -427,6 +539,7 @@ the attempt:
 | `AGENT_MAX_FILE_BYTES` | 60,000 | One `read_file` |
 | `AGENT_MAX_TOTAL_FETCHED_BYTES` | 200,000 | All reads combined |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16,000 | Output per model call |
+| `AGENT_MAX_CONTEXT_TOKENS` | 150,000 | Application limit on input tokens |
 | `AGENT_MODEL_CONTEXT_TOKENS` | 1,000,000 | The model's context window |
 | `AGENT_CONTEXT_SAFETY_MARGIN_TOKENS` | 8,000 | Held back from that window |
 | `AGENT_MAX_PATCH_BYTES` | 60,000 | Submitted diff |
@@ -434,10 +547,18 @@ the attempt:
 
 **Context is measured, not estimated.** Before every generation the worker calls the provider's
 token-counting endpoint with the system prompt, the tool definitions, and the full message history.
-The usable input budget is the context window minus the output reservation minus the safety margin —
-976,000 tokens at the defaults. If a request would exceed it the attempt **stops with an
-explanation**; conversation history is never silently discarded, because context compaction is not
-implemented yet.
+
+Two independent ceilings apply and the **smaller** one wins:
+
+1. `AGENT_MAX_CONTEXT_TOKENS` — an explicit application limit (150,000 by default), and
+2. `AGENT_MODEL_CONTEXT_TOKENS` minus the output reservation minus the safety margin (976,000 at the
+   defaults).
+
+Keeping the application limit explicit matters: moving to a model with a larger window should not
+silently licence a much larger, slower, and more expensive attempt. At the defaults the application
+limit is the binding one, and the failure message names whichever ceiling actually applied. If a
+request would exceed the budget the attempt **stops with an explanation**; conversation history is
+never silently discarded, because context compaction is not implemented yet.
 
 **Retries are disabled.** The SDK is configured with `max_retries=0`, so a failed call is never
 transparently repeated at the cost of the attempt's budget. Note that
@@ -461,6 +582,132 @@ rejected **before** its tool calls run, since the arguments may be incomplete.
 
 Repository content — READMEs included — is given to the model as data, with an explicit instruction
 that any directions found inside it must be ignored.
+
+## Verification: the runner and what a result means
+
+### Supported repositories
+
+One profile: **Python, tested with pytest, needing no dependencies beyond pytest itself.** The runner
+image is `python:3.11-slim` plus a pinned pytest and nothing else.
+
+This is narrow on purpose. Installing what a repository asks for means *executing* what a repository
+asks for — `setup.py`, a `Dockerfile`, a requirements file naming an arbitrary index. So BranchForge
+does none of it. A repository that needs more is reported as an `environment_limitation`, which says
+nothing at all about whether the patch is correct.
+
+Also unsupported, and reported rather than worked around:
+
+- Repositories whose archive contains symlinks, hardlinks, or device entries. Links are **refused**,
+  not sanitized: validating link targets is easy to get subtly wrong.
+- Test suites that write into their own source tree — the source is mounted read-only. Tests needing
+  scratch space must use `tmp_path`, which lands on the container's tmpfs.
+- Suites needing network access, which have none.
+
+### What runs where
+
+The orchestrating worker stays outside the container. Repository code runs **only** inside
+`docker run`, with:
+
+| Constraint | Flag |
+|---|---|
+| No network at all | `--network=none` |
+| Non-root user | `--user 65534:65534` |
+| Read-only root filesystem | `--read-only` |
+| Bounded scratch space | `--tmpfs=/tmp:rw,noexec,nosuid,size=64m` |
+| Memory / CPU / process ceilings | `--memory=512m --cpus=1.0 --pids-limit=256` |
+| No capabilities, no privilege growth | `--cap-drop=ALL --security-opt=no-new-privileges` |
+| No daemon log growth | `--log-driver=none` |
+| Only the source tree (read-only) plus a runner-owned results directory | two `-v` mounts |
+| Removed on exit and on timeout | `--rm`, plus `docker rm -f` after a wall-clock overrun |
+
+No credential, no host home directory, no database file, and no Docker socket is ever passed in. The
+pytest invocation is fixed and runner-owned, including `-o addopts=` so a repository's own ini options
+cannot inject plugins or flags into it. The model's `suggested_test_command` remains display-only and
+is never executed.
+
+**This is local container isolation, not a production multi-tenant security guarantee.** It raises the
+cost of a hostile repository considerably. A container escape is still a container escape.
+
+### The source snapshot
+
+The archive of one exact commit is fetched from `codeload.github.com`, which serves a specific SHA
+directly with no redirect — so the redirect ban in the GitHub client needs no exception. A tarball,
+not a clone: an extracted archive has no `.git` directory, so hooks, clean/smudge filters, submodule
+setup, and repository-supplied git config cannot exist *by construction*.
+
+Extraction is the trust boundary and is hand-written, because `tarfile.data_filter` does not exist on
+Python 3.11.0. It rejects links, devices, traversal, absolute paths, duplicate paths, file/directory
+collisions, and any `.git` entry; counts **decompressed** bytes including tar headers, so a
+compression bomb is bounded by what reading it costs rather than by the sizes it declares; enforces a
+file count and an overall deadline; and discards archive ownership, permissions, and mtimes.
+
+`git apply` runs with every inherited `GIT_*` variable stripped, config pointed at `/dev/null`, and
+`GIT_CEILING_DIRECTORIES` set so repository discovery cannot walk up into a parent repository. Without
+that, your own global git config could change whitespace handling and make a stored result
+irreproducible.
+
+### Four workspaces
+
+| Workspace | Contents | Purpose |
+|---|---|---|
+| `snapshot/` | the commit, untouched | source of truth, never mounted |
+| `baseline/` | copy of the snapshot | the "before" run |
+| `patched_full/` | snapshot + patch, untouched | supplemental run of the patch's own tests |
+| `comparison/` | patched source + **original** test environment | the "after" run — the one that counts |
+
+Before the comparison run, the original tests, every `conftest.py`, fixture and data files, and
+collection configuration (`pytest.ini`, `tox.ini`, `setup.cfg`, `pyproject.toml`) are copied back over
+the patched tree, and any test-environment file the patch *added* is deleted. A patch therefore cannot
+change the tests it is measured against — neither by weakening them nor by adding configuration that
+quietly deselects them.
+
+Your own BranchForge checkout is never touched. All four workspaces are runner-owned temporary
+directories, removed in a `finally`.
+
+### How a fix is decided
+
+Results come from a runner-owned pytest plugin baked into the image (not from parsing terminal
+output), which records the collected node IDs and an explicit outcome per test across the setup, call,
+and teardown phases.
+
+1. The comparison run must collect **exactly** the same node IDs as the baseline. Otherwise the runs
+   are not comparable and the outcome is `collection_mismatch`, however green they look.
+2. A previously failing test counts as fixed only when **that same node ID reports `passed`**.
+   Skipped, xfailed, deselected, and missing are all "not fixed".
+3. A previously passing test that stops running weakens the yardstick, so the outcome is downgraded to
+   `inconclusive` rather than reported as a fix.
+4. A missing, malformed, or oversized report is an error — never an absence of failures.
+
+The claim this supports is narrow: *these tests behaved this way, on this commit, in this profile.* It
+is not a proof of correctness, and it is not protection against a patch deliberately engineered to
+forge results.
+
+### Outcomes
+
+`status` says whether the verification ran (`running` → `completed` | `failed`). `outcome` says what
+it found. They are separate because "the verification completed" and "the patch works" are different
+claims, and a single pass/fail field is how a green badge comes to mean nothing.
+
+| Outcome | Meaning |
+|---|---|
+| `fix_demonstrated` | Every originally failing test now passes; nothing else regressed |
+| `partial_fix` | Some originally failing tests now pass, but not all |
+| `still_failing` | None of the originally failing tests now pass |
+| `regressions` | The patch made previously passing tests fail |
+| `no_bug_demonstrated` | Existing tests pass; bug fix not demonstrated — nothing failed to begin with |
+| `tests_only_patch` | The patch changes only tests or configuration, so the comparison equals the baseline |
+| `patch_did_not_apply` | The patch does not apply to the inspected commit |
+| `collection_mismatch` | The runs collected different tests and cannot be compared |
+| `patched_collection_error` | The patched source fails to import or collect — a defect, not an improvement |
+| `baseline_unusable` | The baseline produced no usable result |
+| `unsupported_layout` | No original pytest suite was found |
+| `environment_limitation` | The profile cannot build this repository; says nothing about the patch |
+| `timeout` | A run exceeded its wall-clock limit and was terminated |
+| `inconclusive` | The runs completed but could not be compared reliably |
+
+pytest's exit codes are kept distinct rather than collapsed: `no_tests_collected` (5), `interrupted`
+(2), `usage_error` (4), `internal_error` (3), and `tests_failed` (1) are different facts, and a
+collection error is not a test failure.
 
 ## Configuration
 
@@ -513,12 +760,15 @@ backend/
     schemas.py       Request/response schemas; UTC timestamp serialization
     validators.py    GitHub repository URL validation and normalization
     repository.py    All database queries — no FastAPI imports
-    worker.py        Worker CLI (inspect, propose); owns transaction boundaries
+    worker.py        Worker CLI (inspect, propose, verify); owns transaction boundaries
     github_client.py Bounded read-only GitHub client; typed errors
     inspection.py    File selection, pytest heuristic, report building
     model_client.py  The model boundary: ModelTurn, protocol, Anthropic adapter
     agent.py         Controller loop, tool dispatch, budgets, prompt building
     patch_validation.py  Unified-diff syntax, hunk counts, path safety
+    snapshot.py      Bounded source-archive download and hardened extraction
+    runner.py        Docker argv, execution, bounded output capture, cleanup
+    verification.py  Baseline/apply/compare orchestration and the outcome vocabulary
     routers/
       health.py      GET /api/health
       runs.py        Run endpoints; thin handlers delegating to repository
@@ -526,12 +776,21 @@ backend/
   alembic/
     env.py           Resolves the URL from DATABASE_URL
     versions/        0001_create_runs_table.py, 0002_create_inspections_table.py,
-                     0003_create_patch_attempts.py
+                     0003_create_patch_attempts.py, 0004_create_verifications.py
+  runner/
+    python-pytest/   The ONLY environment repository code runs in
+      Dockerfile     python:3.11-slim + pinned pytest; nothing else
+      bf_report.py   Runner-owned pytest plugin emitting structured results
   tests/
     conftest.py      Temporary migrated database, dependency override, TestClient
     test_validators.py, test_runs_api.py, test_migrations.py,
     test_worker.py (mocked GitHub), test_claim.py (claim contention),
-    test_agent.py (scripted model), test_attempt_claim.py (contention + leakage)
+    test_agent.py (scripted model), test_attempt_claim.py (contention + leakage),
+    test_snapshot.py (extraction hardening), test_runner_argv.py (isolation flags),
+    test_verification.py (comparison logic), test_verify_worker.py (worker + claim),
+    test_docker_runner.py (REAL containers; skips without Docker)
+    fixture_support.py   Scenario patches, generated with difflib
+    sample_repo/         Fixture repository with a known bug (not collected)
 
 frontend/src/
   App.tsx            Page composition and all data fetching
@@ -539,7 +798,8 @@ frontend/src/
   types.ts           Types mirroring the backend schemas
   time.ts            Absolute and relative timestamp formatting
   components/        NewRunForm, RunList, RunDetail, InspectionPanel,
-                     PatchAttemptPanel, StatusBadge, Callout, NotImplementedNote
+                     PatchAttemptPanel, VerificationPanel, StatusBadge, Callout,
+                     NotImplementedNote
   styles.css         Theme and layout (light and dark)
 ```
 
@@ -606,40 +866,68 @@ Choices made now so a worker process can be added next without rework:
   binary patches, renames, and copies. Passing validation does **not** mean the patch applies or
   works — nothing runs `git apply`.
 
+- **A tarball, not a clone.** An extracted source archive has no `.git` directory, so hooks,
+  clean/smudge filters, submodule setup, and repository-supplied git config cannot exist by
+  construction rather than needing to be disabled by flag. `git apply` works fine outside a
+  repository, which is what makes this practical.
+- **`status` and `outcome` are separate columns on a verification.** "The verification ran" and "the
+  patch works" are different claims. Collapsing them into one boolean is how a badge stops meaning
+  anything, and there is deliberately no value named `verified`.
+- **Test results come from a runner-owned plugin, not from parsing output.** Terminal text cannot
+  distinguish a test that was fixed from one that was skipped, deselected, renamed, or never
+  collected, and those differences are the whole point.
+- **The unique `attempt_id` INSERT is the verification claim**, the same mechanism as the patch
+  attempt: the second worker gets an `IntegrityError`, rolls back, and exits having downloaded nothing
+  and started no container.
+- **Docker and the image are checked before the claim**, so a stopped daemon cannot leave a claimed
+  verification stranded — the same ordering rule as checking model configuration before claiming an
+  attempt.
+
 ## Limitations
 
-Everything below is deliberately out of scope for milestone 1.
-
-- **A proposed patch is unverified.** It is checked for unified-diff syntax and path safety only.
-  Nothing applies it, compiles it, installs dependencies, or runs a test suite — so it may not apply
-  cleanly and may not fix the issue. The suggested test command is text for a human to run.
-- **One attempt per run, and no retries.** A failed attempt cannot be re-run; create a new run.
-  Abrupt interruption can leave an attempt `running` forever, since recovery is not implemented.
-- **One agent, not competing attempts.** `max_parallel_attempts` is still stored and unused; parallel
-  agents and result comparison come later.
+- **A verification result is not a correctness proof.** It reports how the tests that actually ran
+  behaved, on one commit, in one runner profile. Passing tests can coexist with a wrong patch, and the
+  comparison is not protection against a patch deliberately engineered to forge results.
+- **One runner profile: Python plus pytest, no repository dependencies.** Repository dependency
+  installation and setup scripts are never run, because running them means executing repository code
+  on our terms rather than none. A project needing more is reported as an `environment_limitation`.
+- **Repositories using symlinks, hardlinks, or device entries in their archive are refused.** Links
+  are rejected rather than validated.
+- **The source tree is mounted read-only**, so a suite that writes into its own directory reports an
+  environment limitation. Tests must use `tmp_path` for scratch space.
+- **Local container isolation, not a multi-tenant security boundary.** No network, non-root,
+  no capabilities, read-only root, and resource ceilings — but a container escape is still an escape.
+  Do not point this at repositories you have reason to distrust.
+- **One verification per patch attempt, and no retries.** Abrupt interruption can leave a verification
+  `running` forever; recovery is not implemented. Create a new run.
+- **One attempt per run, and one agent, not competing attempts.** `max_parallel_attempts` is stored
+  and still unused; parallel agents and result comparison come later.
 - **No context compaction.** If the conversation would exceed the input budget the attempt stops with
   an explanation rather than dropping history.
-- **The repository is never cloned and its code is never executed.** Everything is read through the
-  GitHub API. Repository content is treated strictly as untrusted data: it is stored as text and
-  displayed as plain text, never evaluated, imported, or followed as instructions.
-- **Nothing is scheduled.** You run the worker yourself, per run, and refresh the page. There is no
+- **The patch is never applied to your checkout.** It is applied only inside runner-owned temporary
+  workspaces, which are deleted afterwards.
+- **The repository is never cloned and its code never runs on the host.** Inspection reads through the
+  GitHub API; verification extracts a source archive and executes it only inside a container.
+  Repository content is treated as untrusted data everywhere: stored as text, displayed as plain text,
+  never evaluated or followed as instructions.
+- **Nothing is scheduled.** You run each worker command yourself and refresh the page. There is no
   queue, poller, or background scheduler.
-- **An interrupted worker leaves a run stuck in `inspecting`.** If the process is killed mid-
-  inspection, nothing resets the run and it cannot be claimed again. Durable recovery (a lease with
-  a timeout, or a reset command) is deliberately out of scope for this milestone.
-- **One inspection per run.** Only a `pending` run can be claimed, so a run cannot be re-inspected —
+- **An interrupted worker leaves a run stuck in `inspecting`.** Nothing resets it and it cannot be
+  claimed again. Durable recovery (a lease with a timeout, or a reset command) is out of scope.
+- **One inspection per run.** Only a `pending` run can be claimed, so a run cannot be re-inspected,
   including after a failure. Create a new run instead.
-- **The Python/pytest assessment is a heuristic** based on filenames and configuration text. A
-  project may use pytest without declaring it, and missing configuration is not evidence that pytest
-  is unsupported. The report always ships the filenames behind its conclusions.
+- **The Python/pytest assessment is a heuristic** based on filenames and configuration text. A project
+  may use pytest without declaring it, and missing configuration is not evidence that pytest is
+  unsupported. The report always ships the filenames behind its conclusions.
 - **Unauthenticated GitHub access only**, so roughly 5 inspections per hour and public repositories
-  only — see [GitHub rate limits](#github-rate-limits).
+  only — see [GitHub rate limits](#github-rate-limits). The source archive download does not count
+  against the REST allowance.
 - **No authentication or authorization.** Every caller sees every run. Do not expose this beyond
   localhost.
 - **SQLite and single-process only.** No connection pooling for concurrent writers, no Postgres
   configuration, no deployment tooling. `DATABASE_URL` is the seam where that changes.
-- **`status` has only one value** (`pending`). The enum will grow when execution exists.
 - **The run list is a single bounded page** — no pagination cursors, filtering, or search.
-- **No automated frontend tests.** The frontend is covered by type checking and a production build.
-- **No authentication on the API**, so anyone who can reach it can read every run. Keep it on
-  localhost.
+- **No automated frontend tests.** The frontend is covered by type checking, a production build, and a
+  server-side render check that asserts hostile strings are escaped.
+- **The dashboard UI has not been verified in a browser.** Click handlers, Refresh, and `<details>`
+  expansion are covered only by the type checker and the render check; see the milestone reports.

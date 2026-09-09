@@ -27,3 +27,6 @@ package = false
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+markers = [
+    "docker: needs a running Docker daemon and the built runner image (deselect with -m 'not docker')",
+]

@@ -83,8 +83,13 @@ class Settings(BaseSettings):
     agent_max_output_tokens: int = 16_000
 
     # Context accounting uses the provider's token-counting endpoint before each
-    # generation. The usable input budget is the model's context window minus the
-    # output reservation and a safety margin.
+    # generation. Two independent ceilings apply and the smaller one wins:
+    #   1. an explicit application limit, so an attempt stays small regardless of
+    #      how large a context the chosen model happens to offer, and
+    #   2. the model's own capacity, less the output reservation and a margin.
+    # Keeping (1) explicit matters: swapping in a bigger model must not silently
+    # licence a far bigger attempt.
+    agent_max_context_tokens: int = 150_000
     agent_model_context_tokens: int = 1_000_000
     agent_context_safety_margin_tokens: int = 8_000
 
@@ -96,13 +101,65 @@ class Settings(BaseSettings):
     agent_max_events: int = 200
     agent_max_event_detail_chars: int = 2_000
 
+    # --- Patch verification (milestone 4) -----------------------------------
+    # The runner image. Build it with:
+    #   docker build -t branchforge-runner-python:1 backend/runner/python-pytest
+    # The tag is resolved to an immutable image ID once per verification, and
+    # that exact ID runs every phase.
+    verify_profile: str = "python-pytest"
+    verify_image: str = "branchforge-runner-python:1"
+    verify_docker_binary: str = "docker"
+
+    # Source snapshot acquisition (codeload archive of one exact commit).
+    verify_max_download_bytes: int = 80_000_000
+    # Counted on the DECOMPRESSED stream including tar headers, so a compression
+    # bomb is bounded by what reading it costs us.
+    verify_max_decompressed_bytes: int = 400_000_000
+    verify_max_snapshot_files: int = 20_000
+    verify_snapshot_deadline_seconds: float = 180.0
+
+    # Container ceilings.
+    verify_container_memory: str = "512m"
+    verify_container_cpus: str = "1.0"
+    verify_container_pids: int = 256
+    verify_container_tmpfs_bytes: int = 64 * 1024 * 1024
+    verify_test_timeout_seconds: float = 300.0
+    verify_cleanup_timeout_seconds: float = 30.0
+    verify_git_timeout_seconds: float = 60.0
+
+    # Bounds on everything captured or persisted.
+    verify_max_log_bytes: int = 200_000
+    verify_max_report_bytes: int = 5_000_000
+    verify_report_max_tests: int = 5_000
+    verify_report_max_message_chars: int = 400
+    verify_max_error_chars: int = 2_000
+
     @property
-    def agent_max_input_tokens(self) -> int:
-        """Usable input budget: context window less output reservation and margin."""
+    def agent_model_context_headroom_tokens(self) -> int:
+        """What the model's own window leaves for input after output and margin."""
         return (
             self.agent_model_context_tokens
             - self.agent_max_output_tokens
             - self.agent_context_safety_margin_tokens
+        )
+
+    @property
+    def agent_max_input_tokens(self) -> int:
+        """Usable input budget: the smaller of the two ceilings above."""
+        return min(self.agent_max_context_tokens, self.agent_model_context_headroom_tokens)
+
+    @property
+    def agent_context_limit_reason(self) -> str:
+        """Which ceiling is binding, so an error message can say so truthfully."""
+        if self.agent_max_context_tokens <= self.agent_model_context_headroom_tokens:
+            return (
+                f"the application limit AGENT_MAX_CONTEXT_TOKENS="
+                f"{self.agent_max_context_tokens:,}"
+            )
+        return (
+            f"the model's capacity ({self.agent_model_context_tokens:,} tokens) less "
+            f"{self.agent_max_output_tokens:,} reserved for output and "
+            f"{self.agent_context_safety_margin_tokens:,} safety margin"
         )
 
     @property

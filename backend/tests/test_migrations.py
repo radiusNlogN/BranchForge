@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 
 from app.database import Base
-from app.models import AttemptEvent, Inspection, PatchAttempt, Run
+from app.models import AttemptEvent, Inspection, PatchAttempt, Run, Verification
 from sqlalchemy.orm import sessionmaker
 from tests.conftest import alembic_config
 
@@ -32,11 +32,17 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
     engine = create_engine(migration_db)
     try:
         inspector = inspect(engine)
-        assert {"runs", "inspections", "patch_attempts", "attempt_events"} <= set(
+        assert {"runs", "inspections", "patch_attempts", "attempt_events", "verifications"} <= set(
             inspector.get_table_names()
         )
 
-        for table in ("runs", "inspections", "patch_attempts", "attempt_events"):
+        for table in (
+            "runs",
+            "inspections",
+            "patch_attempts",
+            "attempt_events",
+            "verifications",
+        ):
             migrated = {column["name"] for column in inspector.get_columns(table)}
             expected = {column.name for column in Base.metadata.tables[table].columns}
             assert migrated == expected, f"{table}: {migrated ^ expected}"
@@ -56,6 +62,19 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
             for index in inspector.get_indexes("patch_attempts")
         }
         assert attempt_indexes.get("ix_patch_attempts_run_id") == 1
+
+        # UNIQUE on verifications.attempt_id is likewise the claim mechanism.
+        verification_indexes = {
+            index["name"]: index["unique"]
+            for index in inspector.get_indexes("verifications")
+        }
+        assert verification_indexes.get("ix_verifications_attempt_id") == 1
+
+        verification_fks = inspector.get_foreign_keys("verifications")
+        assert len(verification_fks) == 1
+        assert verification_fks[0]["referred_table"] == "patch_attempts"
+        assert verification_fks[0]["constrained_columns"] == ["attempt_id"]
+        assert verification_fks[0]["options"]["ondelete"] == "CASCADE"
     finally:
         engine.dispose()
 
@@ -174,5 +193,35 @@ def test_downgrade_removes_the_table(migration_db: str) -> None:
     engine = create_engine(migration_db)
     try:
         assert "runs" not in inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+
+
+def test_a_verification_cannot_reference_a_missing_attempt(migration_db: str) -> None:
+    """Referential integrity for the milestone-4 table, enforced not assumed."""
+    command.upgrade(alembic_config(migration_db), "head")
+
+    engine = create_engine(migration_db)
+    try:
+        with sessionmaker(bind=engine)() as session:
+            session.add(Verification(attempt_id="00000000-0000-0000-0000-000000000000"))
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
+        # A valid reference inserts, and deleting the run cascades all the way down.
+        with sessionmaker(bind=engine)() as session:
+            run = Run(repository_url="https://github.com/o/r", issue_description="x")
+            session.add(run)
+            session.commit()
+            attempt = PatchAttempt(run_id=run.id, model="m", commit_sha="b" * 40)
+            session.add(attempt)
+            session.commit()
+            session.add(Verification(attempt_id=attempt.id, outcome="fix_demonstrated"))
+            session.commit()
+
+            session.delete(run)
+            session.commit()
+            assert session.query(Verification).count() == 0
     finally:
         engine.dispose()

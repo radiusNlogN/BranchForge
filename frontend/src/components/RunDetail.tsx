@@ -4,6 +4,7 @@ import { Callout } from "./Callout";
 import { InspectionPanel } from "./InspectionPanel";
 import { NotImplementedNote } from "./NotImplementedNote";
 import { PatchAttemptPanel } from "./PatchAttemptPanel";
+import { VerificationPanel } from "./VerificationPanel";
 import { StatusBadge } from "./StatusBadge";
 
 interface RunDetailProps {
@@ -123,6 +124,14 @@ export function RunDetail({
             runId={run.id}
             runStatus={run.status}
             attempt={run.patch_attempt}
+            refreshing={loading}
+            onRefresh={onRefresh}
+          />
+
+          <VerificationPanel
+            runId={run.id}
+            hasAttempt={run.patch_attempt !== null && run.patch_attempt.diff !== null}
+            verification={run.verification}
             refreshing={loading}
             onRefresh={onRefresh}
           />

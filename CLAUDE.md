@@ -5,17 +5,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project scope — read this first
 
 BranchForge will eventually investigate GitHub issues by running competing agent-generated fixes in
-isolated environments. **Milestones 1-3 exist: run intake, read-only repository inspection, and one
-bounded patch-proposal agent.** A run is stored `pending`; `worker inspect` moves it to
-`ready`/`failed`; `worker propose` then runs one agent that proposes a patch.
+isolated environments. **Milestones 1-4 exist: run intake, read-only repository inspection, one
+bounded patch-proposal agent, and containerised verification of the proposed patch.** A run is stored
+`pending`; `worker inspect` moves it to `ready`/`failed`; `worker propose` runs one agent that
+proposes a patch; `worker verify` applies that patch to a throwaway copy of the inspected commit and
+runs the repository's own tests before and after, in Docker.
 
-**`ready` means the inspection finished. A proposed patch is UNVERIFIED** — validated for diff
-syntax only, never applied, compiled, or tested.
+**`ready` means the inspection finished.** A patch attempt's `succeeded` means a diff was produced,
+not that it works.
+
+**A verification result is NOT a correctness proof**, and the wording everywhere must keep that
+distinction. It reports how the tests that actually ran behaved, on one commit, in one runner
+profile. There is deliberately no outcome value, badge, or copy that says "verified".
 
 Deliberately absent — do not add these while working on unrelated tasks:
-patch application, test execution, repository cloning or code execution, sandboxing, competing
-parallel agents, context compaction, retries, crash recovery for stuck runs/attempts, scheduling or
-polling, authentication, deployment tooling.
+repository dependency installation, running repository setup scripts or Dockerfiles, executing the
+model's `suggested_test_command`, non-Python runner profiles, applying patches to the user's
+checkout, competing parallel agents, context compaction, retries, crash recovery for stuck
+runs/attempts/verifications, scheduling or polling, authentication, deployment tooling.
 
 **Never add simulated agent activity or fabricated results** — no fake progress bars, spinners
 implying work that isn't happening, placeholder attempt rows, or invented patch output. Never
@@ -49,12 +56,32 @@ uv run pytest -k "validator and reject"                                # by expr
 # Workers (separate processes; same DATABASE_URL as the API)
 uv run python -m app.worker inspect --run-id <UUID>   # pending -> ready | failed
 uv run python -m app.worker propose --run-id <UUID>   # needs ANTHROPIC_API_KEY
+uv run python -m app.worker verify  --run-id <UUID>   # needs Docker + the runner image
 ```
+
+The runner image must exist before `verify`. Build it from the repo root:
+
+```bash
+docker build --provenance=false -t branchforge-runner-python:1 backend/runner/python-pytest
+```
+
+`--provenance=false` keeps it a plain single-platform image. Without it buildx adds attestation
+manifests, and with Docker Desktop's containerd image store `docker image inspect` then intermittently
+reports "No such image" for a tag `docker images` lists — which is why `resolve_image_id` falls back to
+`docker image ls -q`. Do not remove that fallback.
 
 `inspect` exit codes: `0` ok, `1` failed (recorded on the run), `2` no such run, `3` not claimable.
 `propose` exit codes: `0` ok, `1` attempt failed (recorded on the attempt), `2` no such run, `3` the
 run already has an attempt, `4` the run is not `ready`, `5` model not configured (**no attempt row is
-created**). Each step happens at most once per run.
+created**).
+
+`verify` exit codes: `0` the verification **ran** — whatever it found, including "the patch fixes
+nothing" — `1` the verification itself failed (recorded on the row), `2` no such run, `3` already
+verified, `4` no succeeded attempt with a diff and a commit SHA, `6` Docker unavailable (**no
+verification row is created**). Do not "fix" outcome-is-bad-news into a non-zero exit: the exit code
+reports whether the check ran, not what it concluded.
+
+Each step happens at most once per run.
 
 ```bash
 # Frontend setup, dev server → http://localhost:5173
@@ -78,19 +105,45 @@ uv run alembic current
 
 ### Test suite shape
 
-146 tests, all offline. Two mocking boundaries, and new tests should reuse them rather than invent a
-third:
+272 tests. All offline except the 15 marked `docker`, which build real containers.
+
+```bash
+uv run pytest -m "not docker"    # no daemon needed
+uv run pytest -m docker          # only the real container scenarios
+```
+
+Three mocking boundaries. Reuse them rather than inventing a fourth:
 
 - **GitHub** is mocked at the *transport* layer (`FakeGitHub` in `tests/conftest.py` →
   `httpx2.MockTransport`), so real URL construction, byte caps, and status handling execute.
 - **The model** is mocked at the *interface* layer (`ScriptedModelClient`), which replays canned
   `ModelTurn`s and records the message history it was sent — use `.seen_messages` and
   `.last_tool_results()` for assertions.
+- **The container runner** is mocked at the *callable* layer: `run_verification(test_runner=...)`
+  takes anything with the `TestRunner` signature, so orchestration tests script one `RunResult` per
+  workspace phase (`baseline` / `comparison` / `patched_full`). Snapshot acquisition is injected the
+  same way, and `git apply` plus test-environment restoration stay **real** in those tests.
+
+`tests/test_docker_runner.py` marks itself `docker` and skips when the daemon or image is missing —
+**never** relax that into a fake pass. It is the only evidence the isolation flags take effect, and it
+asserts from inside the container that `os.getuid() == 65534`, that `/workspace` is unwritable, and
+that sockets fail.
+
+`tests/test_runner_argv.py` needs no daemon and asserts the argv both positively (every isolation
+flag) and negatively (no credential, no `docker.sock`, no host home, no database, exactly one source
+mount). Write argv assertions there, not in the Docker tier — they should hold even when Docker does
+not exist.
+
+Scenario patches live in `tests/fixture_support.py` and are generated with `difflib`, so hunk headers
+are correct by construction; do not hand-write diffs (an earlier hand-written one was rejected by our
+own validator for a miscounted hunk). `tests/sample_repo/` is a fixture *repository* with a
+deliberately failing test, excluded from our own run by `collect_ignore_glob` in `tests/conftest.py`.
 
 **Never add a test that reaches the network or spends API credit.** Live checks are manual commands
 documented in the README. Contention tests use a barrier plus *independent* engines against one
-temporary file database (`tests/test_claim.py`, `tests/test_attempt_claim.py`); that pattern has teeth
-— a naive read-then-write claim produces two winners under it.
+temporary file database (`tests/test_claim.py`, `tests/test_attempt_claim.py`,
+`tests/test_verify_worker.py`); that pattern has teeth — a naive read-then-write claim produces two
+winners under it.
 
 ### Verifying without destroying the dev database
 
@@ -271,6 +324,114 @@ The notes below were confirmed by real calls in this repository and are safe to 
   identifier — `ANTHROPIC_MODEL` exists so the user picks.
 - `stop_reason` values the loop handles: `tool_use`, `end_turn`, `max_tokens`, `refusal`.
 
+### Verification (milestone 4)
+
+`worker verify` is the only code path that executes repository code, and it executes it **only** inside
+`docker run`. Three modules, each with one job:
+
+- **`app/snapshot.py`** — downloads the source archive of one exact commit from
+  `codeload.github.com` and extracts it. Extraction is the trust boundary.
+- **`app/runner.py`** — builds the `docker run` argv, runs it, captures bounded output, cleans up.
+- **`app/verification.py`** — orchestrates baseline → apply → comparison, and owns the outcome
+  vocabulary.
+
+#### A tarball, not a clone — and why
+
+An extracted archive has **no `.git` directory**, so hooks, clean/smudge filters, submodule setup, and
+repository-supplied git config cannot exist *by construction* rather than needing to be switched off
+one flag at a time. `git apply` works outside a repository, which is what makes this practical. Do not
+replace this with `git clone` to "simplify" it.
+
+Extraction is hand-written because **`tarfile.data_filter` does not exist on Python 3.11.0** (it was
+backported in 3.11.4). Do not delete the manual checks assuming the stdlib covers them. They reject:
+links (symlink *and* hardlink — refused, never target-validated), devices and FIFOs, `..` traversal,
+absolute paths, members outside the archive's own top-level prefix, duplicate normalized paths,
+file/directory collisions, and any `.git` entry.
+
+Byte accounting is on the **decompressed** stream (`gzip.GzipFile` wrapped in a counting reader feeding
+`tarfile` in `mode="r|"`), so tar headers and padding count too. Summing the file sizes an archive
+declares is not a bound — a bomb can declare anything. There is also a file count and an overall
+deadline. Extraction discards archive ownership, permissions, and mtimes, then normalizes to 0755
+directories and 0644 files, because the container's non-root UID must be able to traverse a read-only
+mount.
+
+#### `git apply` hermeticity
+
+Every inherited `GIT_*` variable is stripped, config points at `/dev/null`, and
+`GIT_CEILING_DIRECTORIES` stops repository discovery walking up into whatever repository contains the
+temp directory. Without this the developer's own git config can change whitespace handling, which makes
+the persisted `runner_args` non-reproducible. Never pass `--unsafe-paths`.
+
+#### Container invariants
+
+`build_run_argv` is an argument **array**; nothing from the repository, the model, or the issue text
+reaches it. The flags are not decoration — `tests/test_runner_argv.py` asserts each one, so removing
+any of them fails a test:
+
+`--network=none`, `--user 65534:65534`, `--read-only`, a bounded `--tmpfs` for `/tmp`,
+`--memory/--cpus/--pids-limit`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`,
+`--log-driver=none`, `--rm` plus a `--name` for forced removal.
+
+Three easy mistakes, all already handled:
+
+- **`-e HOME=/tmp` is load-bearing.** `--read-only` plus a non-root UID breaks before collection
+  without a writable HOME.
+- **Mount paths must be `realpath`'d.** macOS `mkdtemp()` returns `/var/folders/...`; Docker Desktop
+  only shares the `/private/var/folders/...` it resolves to.
+- **`--log-driver=none` is separate from our own cap.** Bounding the buffer we read does not bound the
+  daemon's log file.
+- **The reader keeps draining after the retention cap.** Stopping would fill the pipe and block the
+  container, turning an output cap into a hang.
+
+`-o addopts=` is what makes the pytest invocation genuinely runner-owned: without it a repository's ini
+`addopts` could inject plugins into our command line. The image **ID** is resolved once up front and
+that exact ID runs all phases, so a moving tag cannot make the phases incomparable.
+
+#### Structured results, not parsed output
+
+`runner/python-pytest/bf_report.py` is a runner-owned pytest plugin baked into the **image** (not the
+workspace) and loaded via `-p bf_report` from a PYTHONPATH entry that precedes the repository, so a
+repository module cannot shadow it. It writes collected node IDs and an explicit per-test outcome
+across setup/call/teardown to a runner-owned `/results` mount.
+
+This exists because terminal output cannot distinguish a test that was **fixed** from one that was
+skipped, deselected, renamed, or never collected — and that distinction is the entire point. Do not
+replace it with output parsing.
+
+#### The four rules that decide a fix
+
+Changing any of these changes what BranchForge claims, so change them deliberately:
+
+1. **Collected identities must match.** The comparison run must collect exactly the baseline's node
+   IDs, else `collection_mismatch`.
+2. **A fix requires an explicit `passed`** for that same node ID. Skipped, xfailed, deselected, and
+   missing are recorded in `no_longer_exercised` and are *not* fixes.
+3. **A previously passing test that stops running** is a weakened yardstick ⇒ `inconclusive`, never a
+   fix.
+4. **A missing, malformed, or oversized report is an error**, never an absence of failures.
+
+And the asymmetry that matters most: **a patched-only collection or import failure is
+`patched_collection_error`, never an improvement** — the failing set went empty because nothing ran.
+This is verified live against a real repository, not only in mocks.
+
+#### Four workspaces, and why `comparison` is not `patched_full`
+
+`snapshot/` (pristine, never mounted) → `baseline/`, `patched_full/` (patch applied, untouched),
+`comparison/` (patched source + **original** test environment restored).
+
+`restore_original_test_environment` copies the original tests, every `conftest.py`, fixture data, and
+collection config back over the patched tree **and deletes test-environment files the patch added**.
+Both directions are needed: restoring alone would leave a patch-added `conftest.py` free to change
+collection. Supplemental runs of the patch's own tests use `patched_full` and persist to their own
+columns — a supplemental timeout must never overwrite the baseline-versus-patched verdict.
+
+#### Ordering rules
+
+Docker availability and the image ID are resolved **before** the claim, so a stopped daemon cannot
+leave a claimed verification stranded — the same rule as checking model configuration before claiming
+an attempt. An unusable baseline short-circuits before the comparison container runs. No session is
+held open across a download or a container run.
+
 ## Frontend rules
 
 - **Never `dangerouslySetInnerHTML`, and no markdown-to-HTML library.** Repository text renders as
@@ -284,6 +445,13 @@ The notes below were confirmed by real calls in this repository and are safe to 
 - **"Unverified patch — not applied or tested" must stay adjacent to the diff**, not in a footer.
 - The suggested test command is display-only. Do not add a run button or anything that reads as
   executable.
+- **`VerificationPanel` must never render a pass/fail badge.** The outcome is stated in words from
+  `OUTCOME_LABELS`, and only `fix_demonstrated` / `partial_fix` are styled as good news. The word
+  "verified" does not appear in the panel, and an SSR check asserts that.
+- Container logs are untrusted program output: plain text in `<pre>`, inside `<details>`. No
+  highlighting, no HTML.
+- The scope sentence next to the outcome (which commit, which profile, "not a proof of correctness")
+  is part of the result, not decoration.
 
 ## Constraints on dependencies
 
@@ -295,6 +463,13 @@ The notes below were confirmed by real calls in this repository and are safe to 
   an attempt's budget. The request timeout is per HTTP request, **not** a whole-attempt deadline.
 - **Credentials**: the key is a `SecretStr` in settings, read from `ANTHROPIC_API_KEY`. Never log it,
   persist it, or return it. Leakage tests use a synthetic sentinel value — never the real key.
+
+- **Docker is required only by `worker verify`.** Everything else — the API, `inspect`, `propose`, and
+  every test except the `docker`-marked ones — runs without it. Keep it that way: do not make the API
+  or the test suite depend on a daemon.
+- **The runner image pins pytest** (`ARG PYTEST_VERSION`) so a verification is reproducible. The image
+  deliberately contains nothing else; adding repository dependencies to it would defeat the point of
+  the profile.
 
 - **Vite is pinned to the 6 line on purpose.** Vite 7+ and `@vitejs/plugin-react` 5+ require Node
   `^20.19.0 || >=22.12.0`; this environment has Node 20.10.0. `package.json`'s `engines.node`
@@ -316,25 +491,41 @@ would otherwise require JSON for a list-typed field.
 **`RUN_LIST_MAX_LIMIT` must stay ≥ 25**: the dashboard requests 25 runs per list call, so a lower
 ceiling makes every list request fail with a 422.
 
-## Two status enums, each spanning four places
+## Three status enums, each spanning four places
 
-Both are **literal unions** in `frontend/src/types.ts`, so a new value arriving from the API against a
+All are **literal unions** in `frontend/src/types.ts`, so a new value arriving from the API against a
 stale type is a runtime mismatch `tsc` cannot catch. Update all four places together.
 
 | Enum | Values | Defined in | Mirrored in | Styled in |
 |---|---|---|---|---|
 | Run | `pending → inspecting → ready \| failed` | `models.py` `RUN_STATUS_*`, `schemas.py` `RunStatus` | `types.ts` `RunStatus` | `StatusBadge.tsx` |
 | Attempt | `running → succeeded \| failed` | `models.py` `ATTEMPT_STATUS_*`, `schemas.py` `AttemptStatus` | `types.ts` `AttemptStatus` | `PatchAttemptPanel.tsx` |
+| Verification | `running → completed \| failed` | `models.py` `VERIFY_STATUS_*`, `schemas.py` `VerificationStatus` | `types.ts` `VerificationStatus` | `VerificationPanel.tsx` |
 
-They are independent on purpose — see the note under Database schema.
+All three are independent on purpose — see the note under Database schema.
+
+**A verification's `outcome` is a fourth vocabulary and is deliberately NOT an enum type.** It is a
+plain string column, defined once in `app/verification.py` as `OUTCOME_*` constants with
+`OUTCOME_DESCRIPTIONS`, and labelled for display in `VerificationPanel.tsx`'s `OUTCOME_LABELS`. Adding
+an outcome means touching those two places. Never add one called `verified`, and never collapse the
+set into a boolean.
 
 ## Database schema
 
-Three migrations: `0001` (runs), `0002` (inspections), `0003` (`patch_attempts` + `attempt_events`).
-Every child FK is `ON DELETE CASCADE`; `inspections.run_id` and `patch_attempts.run_id` are both
-`UNIQUE` (one each per run). `app/database.py` sets `PRAGMA foreign_keys=ON` for every SQLite
-connection via an `Engine` `"connect"` listener, so foreign keys are genuinely enforced for the API,
-the workers, and the tests. `tests/test_migrations.py` asserts all of it.
+Four migrations: `0001` (runs), `0002` (inspections), `0003` (`patch_attempts` + `attempt_events`),
+`0004` (`verifications`). Every child FK is `ON DELETE CASCADE`. Three columns are `UNIQUE`, and in each
+case the uniqueness **is** the claim mechanism rather than merely a constraint:
+`inspections.run_id`, `patch_attempts.run_id`, and `verifications.attempt_id`.
 
-**Run status vs attempt status.** `Run.status` describes inspection only. A run stays `ready` whether
-a patch attempt succeeds or fails — no attempt code path may write `Run.status`.
+Note the parent differs: a verification hangs off the **patch attempt**, not the run, because it
+verifies a specific proposed patch. Deleting a run therefore cascades runs → attempts → verifications.
+
+`app/database.py` sets `PRAGMA foreign_keys=ON` for every SQLite connection via an `Engine` `"connect"`
+listener, so foreign keys are genuinely enforced for the API, the workers, and the tests.
+`tests/test_migrations.py` asserts all of it, including that a verification cannot reference a missing
+attempt.
+
+**The three statuses are independent, and this is asserted.** `Run.status` describes inspection only;
+`PatchAttempt.status` describes whether a diff was produced. A run stays `ready` and an attempt stays
+`succeeded` however badly a verification turns out — **no verification code path may write `Run.status`
+or `PatchAttempt.status`.**

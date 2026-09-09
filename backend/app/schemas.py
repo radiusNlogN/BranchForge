@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import (
     AfterValidator,
@@ -23,6 +23,9 @@ from app.models import (
     RUN_STATUS_INSPECTING,
     RUN_STATUS_PENDING,
     RUN_STATUS_READY,
+    VERIFY_STATUS_COMPLETED,
+    VERIFY_STATUS_FAILED,
+    VERIFY_STATUS_RUNNING,
 )
 from app.time_utils import to_iso_utc
 from app.validators import validate_github_repository_url
@@ -257,8 +260,70 @@ class PatchAttemptRead(BaseModel):
         return to_iso_utc(value) if value is not None else None
 
 
+# --- Verification -----------------------------------------------------------
+
+
+class VerificationStatus(str, Enum):
+    """Did the verification run? Separate from what it found."""
+
+    RUNNING = VERIFY_STATUS_RUNNING
+    COMPLETED = VERIFY_STATUS_COMPLETED
+    FAILED = VERIFY_STATUS_FAILED
+
+
+class VerificationRead(BaseModel):
+    """A persisted verification.
+
+    `status` reports whether the verification executed; `outcome` reports what it
+    found. Both are needed: a completed verification whose outcome is
+    `still_failing` is a successful verification of an unsuccessful patch.
+
+    The claim is narrow by construction — it covers the tests that actually ran,
+    on one commit, in one runner profile.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    attempt_id: str
+    status: VerificationStatus
+    outcome: str | None
+    detail: str | None
+
+    commit_sha: str | None
+    patch_sha256: str | None
+    profile: str | None
+    image_ref: str | None
+    image_id: str | None
+    runner_args: list[str] | None = None
+
+    patch_applied: bool
+    patch_apply_message: str | None
+    patch_touched_tests: bool
+    files_changed: list[str] | None = None
+
+    baseline_summary: dict[str, Any] | None = None
+    patched_summary: dict[str, Any] | None = None
+    comparison: dict[str, Any] | None = None
+    baseline_log: str | None = None
+    patched_log: str | None = None
+
+    supplemental_summary: dict[str, Any] | None = None
+    supplemental_log: str | None = None
+
+    notes: list[str] | None = None
+    error_kind: str | None
+    error_message: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+    @field_serializer("started_at", "completed_at")
+    def _serialize_timestamp(self, value: datetime | None) -> str | None:
+        return to_iso_utc(value) if value is not None else None
+
+
 class RunDetailRead(RunRead):
-    """A run plus its inspection and patch attempt, for the detail view.
+    """A run plus its inspection, patch attempt, and verification.
 
     The list endpoint deliberately returns `RunRead` without these — they would
     make a list response unbounded.
@@ -266,6 +331,7 @@ class RunDetailRead(RunRead):
 
     inspection: InspectionRead | None = None
     patch_attempt: PatchAttemptRead | None = None
+    verification: VerificationRead | None = None
 
 
 class HealthRead(BaseModel):

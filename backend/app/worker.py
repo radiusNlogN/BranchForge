@@ -25,14 +25,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import agent, github_client, repository
+from app import agent, github_client, repository, runner, verification
 from app.agent import AgentFailure
 from app.config import Settings, settings
 from app.database import SessionLocal
 from app.github_client import ClientLimits, GitHubClient, GitHubError
 from app.inspection import inspect_repository
 from app.model_client import AnthropicModelClient, ModelClient, ModelNotConfigured
-from app.models import RUN_STATUS_PENDING, RUN_STATUS_READY
+from app.models import ATTEMPT_STATUS_SUCCEEDED, RUN_STATUS_PENDING, RUN_STATUS_READY
+from app import snapshot as snapshot_module
 from app.schemas import InspectionReport
 from app.time_utils import utcnow
 
@@ -43,6 +44,9 @@ EXIT_RUN_NOT_FOUND = 2
 EXIT_NOT_CLAIMED = 3
 EXIT_NOT_READY = 4
 EXIT_NOT_CONFIGURED = 5
+EXIT_VERIFICATION_FAILED = 1
+EXIT_NO_PATCH = 4
+EXIT_DOCKER_UNAVAILABLE = 6
 
 SessionFactory = Callable[[], Session] | sessionmaker[Session]
 ClientFactory = Callable[[Settings], GitHubClient]
@@ -337,6 +341,178 @@ def propose_patch(
     return EXIT_OK
 
 
+def verify_patch(
+    run_id: str,
+    *,
+    session_factory: SessionFactory | None = None,
+    config: Settings | None = None,
+    image_id: str | None = None,
+    snapshot_fetcher: Any = None,
+    test_runner: Any = None,
+    out: Any = sys.stdout,
+) -> int:
+    """Run the proposed patch against the repository's own tests in containers.
+
+    Ordering matters and mirrors `propose`: everything that can fail cheaply is
+    checked *before* the claim, so a missing image or a stopped Docker daemon
+    never leaves a claimed verification behind.
+
+    Repository code executes only inside the container. This process orchestrates
+    and never imports, installs, or runs anything from the repository.
+    """
+    session_factory = session_factory or SessionLocal
+    config = config or settings
+
+    def emit(message: str) -> None:
+        print(message, file=out)
+
+    # --- 1. Preconditions, in a short read-only session ----------------------
+    with _session(session_factory) as db:
+        run = repository.get_run(db, run_id)
+        if run is None:
+            emit(f"No run found with id {run_id!r}.")
+            return EXIT_RUN_NOT_FOUND
+
+        attempt = repository.get_patch_attempt_for_run(db, run_id)
+        if attempt is None:
+            emit(
+                f"Run {run_id} has no patch attempt to verify. Propose one first:\n"
+                f"  uv run python -m app.worker propose --run-id {run_id}"
+            )
+            return EXIT_NO_PATCH
+        if attempt.status != ATTEMPT_STATUS_SUCCEEDED or not attempt.diff:
+            emit(
+                f"The patch attempt for run {run_id} is {attempt.status!r} with no "
+                f"stored diff. There is nothing to verify."
+            )
+            return EXIT_NO_PATCH
+        if not attempt.commit_sha:
+            emit(
+                f"The patch attempt for run {run_id} has no recorded commit SHA, so "
+                f"the exact source it was written against cannot be retrieved."
+            )
+            return EXIT_NO_PATCH
+
+        attempt_id = attempt.id
+        diff = attempt.diff
+        commit_sha = attempt.commit_sha
+        repository_url = run.repository_url
+
+    # --- 2. Docker and the image, BEFORE claiming ----------------------------
+    limits = verification.runner_limits_from(config)
+    try:
+        resolved_image_id = image_id or runner.resolve_image_id(
+            config.verify_image, limits=limits
+        )
+    except runner.DockerUnavailable as error:
+        emit(f"Docker is unavailable: {error}")
+        emit("No verification was created.")
+        return EXIT_DOCKER_UNAVAILABLE
+
+    # --- 3. Claim by inserting the verification row --------------------------
+    with _session(session_factory) as db:
+        claimed = repository.claim_verification(
+            db,
+            attempt_id=attempt_id,
+            commit_sha=commit_sha,
+            patch_sha256=verification.patch_fingerprint(diff),
+            profile=config.verify_profile,
+            image_ref=config.verify_image,
+            image_id=resolved_image_id,
+        )
+        if claimed is None:
+            emit(
+                f"Run {run_id} already has a verification. One verification per patch "
+                f"in this milestone; exiting without starting any container."
+            )
+            return EXIT_NOT_CLAIMED
+        verification_id = claimed.id
+
+    emit(f"Claimed verification for run {run_id}")
+    emit(f"Profile: {config.verify_profile} | image {config.verify_image} ({resolved_image_id[:19]})")
+    emit(f"Commit: {commit_sha}")
+    emit("Repository code runs only inside a disposable container with no network.")
+
+    def record(kind: str, summary: str, detail: str | None) -> None:
+        emit(f"  · {summary}")
+
+    # --- 4. Snapshot, containers, comparison — no session held open ----------
+    try:
+        result = verification.run_verification(
+            repository_url=repository_url,
+            commit_sha=commit_sha,
+            diff=diff,
+            config=config,
+            image_id=resolved_image_id,
+            record=record,
+            snapshot_fetcher=snapshot_fetcher,
+            test_runner=test_runner,
+        )
+    except (snapshot_module.SnapshotError, runner.RunnerError) as error:
+        with _session(session_factory) as db:
+            repository.save_verification_failure(
+                db,
+                verification_id=verification_id,
+                error_kind=getattr(error, "kind", "verification_error"),
+                error_message=str(error),
+                max_error_chars=config.verify_max_error_chars,
+            )
+        emit(f"Verification failed ({getattr(error, 'kind', 'error')}): {error}")
+        return EXIT_VERIFICATION_FAILED
+
+    # --- 5. Persist the outcome ---------------------------------------------
+    with _session(session_factory) as db:
+        repository.save_verification_result(
+            db,
+            verification_id=verification_id,
+            outcome=result.outcome,
+            detail=result.detail,
+            patch_applied=result.patch_applied,
+            patch_apply_message=result.apply_message,
+            patch_touched_tests=result.patch_touched_tests,
+            files_changed=result.files_changed,
+            runner_args=result.runner_args,
+            baseline_summary=result.baseline.to_json() if result.baseline else None,
+            patched_summary=result.patched.to_json() if result.patched else None,
+            comparison=result.comparison.to_json() if result.comparison else None,
+            baseline_log=result.baseline_log,
+            patched_log=result.patched_log,
+            supplemental_summary=(
+                result.supplemental.to_json() if result.supplemental else None
+            ),
+            supplemental_log=result.supplemental_log,
+            notes=result.notes,
+            max_log_chars=config.verify_max_log_bytes,
+            max_error_chars=config.verify_max_error_chars,
+        )
+
+    emit("")
+    emit(f"Outcome: {result.outcome}")
+    emit(f"  {result.detail}")
+    if result.baseline is not None:
+        emit(
+            f"  baseline: {result.baseline.kind} — {len(result.baseline.failing)} failing "
+            f"of {len(result.baseline.collected)} collected"
+        )
+    if result.patched is not None:
+        emit(
+            f"  patched : {result.patched.kind} — {len(result.patched.failing)} failing "
+            f"of {len(result.patched.collected)} collected"
+        )
+    if result.supplemental is not None:
+        emit(f"  supplemental (the patch's own tests): {result.supplemental.kind}")
+    for note in result.notes:
+        emit(f"  note: {note}")
+    for problem in result.cleanup_errors:
+        emit(f"  cleanup: {problem}")
+    emit("")
+    emit(
+        "This covers only the tests that ran, on this commit, in this runner "
+        "profile. It is not proof the patch is correct."
+    )
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.worker",
@@ -362,6 +538,14 @@ def build_parser() -> argparse.ArgumentParser:
     propose_parser.add_argument(
         "--run-id", required=True, help="UUID of an inspected ('ready') run."
     )
+
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Apply the proposed patch and run the repository's tests in Docker.",
+    )
+    verify_parser.add_argument(
+        "--run-id", required=True, help="UUID of a run with a proposed patch."
+    )
     return parser
 
 
@@ -371,6 +555,8 @@ def main(argv: list[str] | None = None) -> int:
         return inspect_run(args.run_id)
     if args.command == "propose":
         return propose_patch(args.run_id)
+    if args.command == "verify":
+        return verify_patch(args.run_id)
     return EXIT_OK  # pragma: no cover - argparse enforces a known command
 
 

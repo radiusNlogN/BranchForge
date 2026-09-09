@@ -5,6 +5,12 @@ running the real Alembic migrations — not `create_all`. That way the migration
 exercised by the whole suite and a broken migration fails the tests.
 """
 
+# `sample_repo/` is a fixture *repository*, not part of this suite: it contains a
+# deliberately failing test used to verify the verifier. Collecting it here would
+# fail our own run.
+collect_ignore_glob = ["sample_repo/*", "sample_repo/**/*"]
+
+
 import base64
 import json
 import threading
