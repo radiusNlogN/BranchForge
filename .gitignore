@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local databases (never commit these)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Environment files — only .env.example is tracked
+.env
+.env.local
+.env.*.local
+
+# Node / frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
