@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 
 from app.database import Base
-from app.models import Inspection, Run
+from app.models import AttemptEvent, Inspection, PatchAttempt, Run
 from sqlalchemy.orm import sessionmaker
 from tests.conftest import alembic_config
 
@@ -32,9 +32,11 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
     engine = create_engine(migration_db)
     try:
         inspector = inspect(engine)
-        assert {"runs", "inspections"} <= set(inspector.get_table_names())
+        assert {"runs", "inspections", "patch_attempts", "attempt_events"} <= set(
+            inspector.get_table_names()
+        )
 
-        for table in ("runs", "inspections"):
+        for table in ("runs", "inspections", "patch_attempts", "attempt_events"):
             migrated = {column["name"] for column in inspector.get_columns(table)}
             expected = {column.name for column in Base.metadata.tables[table].columns}
             assert migrated == expected, f"{table}: {migrated ^ expected}"
@@ -47,6 +49,13 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
 
         index_names = {index["name"] for index in inspector.get_indexes("inspections")}
         assert "ix_inspections_run_id" in index_names
+
+        # UNIQUE on patch_attempts.run_id is the claim mechanism.
+        attempt_indexes = {
+            index["name"]: index["unique"]
+            for index in inspector.get_indexes("patch_attempts")
+        }
+        assert attempt_indexes.get("ix_patch_attempts_run_id") == 1
     finally:
         engine.dispose()
 
@@ -70,6 +79,15 @@ def test_foreign_keys_are_enforced(migration_db: str) -> None:
                 session.commit()
             session.rollback()
 
+        # An attempt cannot reference a nonexistent run either.
+        with sessionmaker(bind=engine)() as session:
+            session.add(
+                PatchAttempt(run_id="00000000-0000-0000-0000-000000000000", model="m")
+            )
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
         # A valid reference still inserts, and cascades on delete.
         with sessionmaker(bind=engine)() as session:
             run = Run(repository_url="https://github.com/o/r", issue_description="x")
@@ -78,9 +96,20 @@ def test_foreign_keys_are_enforced(migration_db: str) -> None:
             session.add(Inspection(run_id=run.id, commit_sha="a" * 40))
             session.commit()
 
+            attempt = PatchAttempt(run_id=run.id, model="m", commit_sha="b" * 40)
+            session.add(attempt)
+            session.commit()
+            session.add(
+                AttemptEvent(attempt_id=attempt.id, seq=1, kind="k", summary="s")
+            )
+            session.commit()
+
             session.delete(run)
             session.commit()
+            # Cascades reach inspections, attempts, and their events.
             assert session.query(Inspection).count() == 0
+            assert session.query(PatchAttempt).count() == 0
+            assert session.query(AttemptEvent).count() == 0
     finally:
         engine.dispose()
 

@@ -10,6 +10,7 @@ dependencies = [
     "sqlalchemy>=2.0.52",
     "alembic>=1.19.2",
     "uvicorn[standard]>=0.52.4",
+    "anthropic>=1.4.0",
 ]
 
 [dependency-groups]

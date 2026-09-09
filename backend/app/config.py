@@ -7,6 +7,7 @@ the app and by Alembic.
 
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
@@ -58,6 +59,51 @@ class Settings(BaseSettings):
     # Report shaping.
     github_max_files_listed: int = 500
     github_max_files_fetched: int = 8
+
+    # --- Patch-proposal agent (milestone 3) ---------------------------------
+    # Read from ANTHROPIC_API_KEY. SecretStr so the value cannot be printed by
+    # an accidental repr of settings; it is never logged, persisted, or returned.
+    anthropic_api_key: SecretStr | None = None
+    # No model identifier is invented here; override with ANTHROPIC_MODEL.
+    anthropic_model: str = "claude-opus-5"
+
+    # Implicit retries are disabled for this milestone: a retry would silently
+    # re-spend budget. NOTE: the timeout below is per HTTP request, not a
+    # deadline for the whole attempt — turn and tool-call limits bound that.
+    agent_request_timeout_seconds: float = 120.0
+
+    agent_max_turns: int = 8
+    agent_max_tool_calls: int = 12
+
+    agent_max_file_bytes: int = 60_000
+    agent_max_total_fetched_bytes: int = 200_000
+
+    # Output tokens per model call. Deliberately not lowballed — a response cut
+    # off at max_tokens is recorded as a failure, never stored as a patch.
+    agent_max_output_tokens: int = 16_000
+
+    # Context accounting uses the provider's token-counting endpoint before each
+    # generation. The usable input budget is the model's context window minus the
+    # output reservation and a safety margin.
+    agent_model_context_tokens: int = 1_000_000
+    agent_context_safety_margin_tokens: int = 8_000
+
+    # Bounds on everything persisted.
+    agent_max_patch_bytes: int = 60_000
+    agent_max_summary_chars: int = 4_000
+    agent_max_test_command_chars: int = 500
+    agent_max_error_chars: int = 2_000
+    agent_max_events: int = 200
+    agent_max_event_detail_chars: int = 2_000
+
+    @property
+    def agent_max_input_tokens(self) -> int:
+        """Usable input budget: context window less output reservation and margin."""
+        return (
+            self.agent_model_context_tokens
+            - self.agent_max_output_tokens
+            - self.agent_context_safety_margin_tokens
+        )
 
     @property
     def cors_origin_list(self) -> list[str]:

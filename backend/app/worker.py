@@ -25,21 +25,28 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import github_client, repository
+from app import agent, github_client, repository
+from app.agent import AgentFailure
 from app.config import Settings, settings
 from app.database import SessionLocal
 from app.github_client import ClientLimits, GitHubClient, GitHubError
 from app.inspection import inspect_repository
-from app.models import RUN_STATUS_PENDING
+from app.model_client import AnthropicModelClient, ModelClient, ModelNotConfigured
+from app.models import RUN_STATUS_PENDING, RUN_STATUS_READY
+from app.schemas import InspectionReport
 from app.time_utils import utcnow
 
 EXIT_OK = 0
 EXIT_INSPECTION_FAILED = 1
+EXIT_ATTEMPT_FAILED = 1
 EXIT_RUN_NOT_FOUND = 2
 EXIT_NOT_CLAIMED = 3
+EXIT_NOT_READY = 4
+EXIT_NOT_CONFIGURED = 5
 
 SessionFactory = Callable[[], Session] | sessionmaker[Session]
 ClientFactory = Callable[[Settings], GitHubClient]
+ModelFactory = Callable[[Settings], ModelClient]
 
 
 def default_client_factory(config: Settings) -> GitHubClient:
@@ -58,6 +65,11 @@ def default_client_factory(config: Settings) -> GitHubClient:
             max_content_response_bytes=config.github_max_content_response_bytes,
         ),
     )
+
+
+def default_model_factory(config: Settings) -> ModelClient:
+    """Build the real model client. Raises ModelNotConfigured if unusable."""
+    return AnthropicModelClient(config)
 
 
 @contextmanager
@@ -176,6 +188,155 @@ def inspect_run(
     return EXIT_OK
 
 
+def propose_patch(
+    run_id: str,
+    *,
+    session_factory: SessionFactory | None = None,
+    client_factory: ClientFactory | None = None,
+    model_factory: ModelFactory | None = None,
+    config: Settings | None = None,
+    out: Any = sys.stdout,
+) -> int:
+    """Run one bounded agent attempt to propose a patch for an inspected run.
+
+    Transaction discipline matches the inspect command: short sessions only, and
+    no session held open across model or GitHub calls. Operational events are
+    committed as they happen so the dashboard can show progress mid-attempt.
+
+    The proposed patch is never applied and no repository code is executed.
+    """
+    session_factory = session_factory or SessionLocal
+    client_factory = client_factory or default_client_factory
+    model_factory = model_factory or default_model_factory
+    config = config or settings
+
+    def emit(message: str) -> None:
+        print(message, file=out)
+
+    # --- 1. Preconditions, in a short read-only session ----------------------
+    with _session(session_factory) as db:
+        run = repository.get_run(db, run_id)
+        if run is None:
+            emit(f"No run found with id {run_id!r}.")
+            return EXIT_RUN_NOT_FOUND
+
+        if run.status != RUN_STATUS_READY:
+            emit(
+                f"Run {run_id} is {run.status!r}, not 'ready'. Inspect it first:\n"
+                f"  uv run python -m app.worker inspect --run-id {run_id}"
+            )
+            return EXIT_NOT_READY
+
+        inspection = repository.get_inspection_for_run(db, run_id)
+        if inspection is None or not inspection.report:
+            emit(
+                f"Run {run_id} has no inspection report to work from. Re-inspect it first."
+            )
+            return EXIT_NOT_READY
+
+        repository_url = run.repository_url
+        issue_description = run.issue_description
+        commit_sha = inspection.commit_sha
+        report = InspectionReport.model_validate(inspection.report)
+
+    # --- 2. Model configuration BEFORE claiming ------------------------------
+    # A missing key must not leave a claimed attempt behind.
+    try:
+        model = model_factory(config)
+    except ModelNotConfigured as error:
+        emit(f"Model is not configured: {error}")
+        emit("No attempt was created.")
+        return EXIT_NOT_CONFIGURED
+
+    # --- 3. Claim by inserting the attempt row -------------------------------
+    with _session(session_factory) as db:
+        attempt = repository.claim_patch_attempt(
+            db, run_id=run_id, model=model.model, commit_sha=commit_sha
+        )
+        if attempt is None:
+            emit(
+                f"Run {run_id} already has a patch attempt. One attempt per run in "
+                f"this milestone; exiting without calling the model."
+            )
+            return EXIT_NOT_CLAIMED
+        attempt_id = attempt.id
+
+    emit(f"Claimed patch attempt for run {run_id}")
+    emit(f"Model: {model.model} | commit {commit_sha}")
+    emit("Proposing a patch (read-only; nothing is applied or executed)")
+
+    # --- 4. Agent work, with no session held open ----------------------------
+    def record(kind: str, summary: str, detail: str | None) -> None:
+        """Commit one event immediately, in its own short transaction."""
+        with _session(session_factory) as event_db:
+            repository.record_attempt_event(
+                event_db,
+                attempt_id=attempt_id,
+                kind=kind,
+                summary=summary,
+                detail=detail,
+                max_events=config.agent_max_events,
+                max_detail_chars=config.agent_max_event_detail_chars,
+            )
+        emit(f"  · {summary}")
+
+    github = client_factory(config)
+    try:
+        try:
+            result = agent.run_agent(
+                model=model,
+                github=github,
+                repository_url=repository_url,
+                issue_description=issue_description,
+                report=report,
+                commit_sha=commit_sha or "",
+                config=config,
+                record=record,
+            )
+        finally:
+            closer = getattr(github, "_client", None)
+            if closer is not None:
+                closer.close()
+    except AgentFailure as failure:
+        with _session(session_factory) as db:
+            repository.save_attempt_failure(
+                db,
+                attempt_id=attempt_id,
+                error_kind=failure.kind,
+                error_message=str(failure),
+                input_tokens=None,
+                output_tokens=None,
+                max_error_chars=config.agent_max_error_chars,
+            )
+        emit(f"Attempt failed ({failure.kind}): {failure}")
+        emit(f"Run {run_id} is still 'ready' — inspection is unaffected.")
+        return EXIT_ATTEMPT_FAILED
+
+    # --- 5. Patch and success status, one transaction ------------------------
+    with _session(session_factory) as db:
+        repository.save_attempt_success(
+            db,
+            attempt_id=attempt_id,
+            diff=result.patch.diff,
+            summary=result.patch.summary,
+            suggested_test_command=result.patch.suggested_test_command,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            max_summary_chars=config.agent_max_summary_chars,
+            max_command_chars=config.agent_max_test_command_chars,
+        )
+
+    emit(
+        f"Proposed a patch touching {len(result.patch.files_changed)} file(s): "
+        + ", ".join(result.patch.files_changed)
+    )
+    if result.input_tokens is not None or result.output_tokens is not None:
+        emit(f"  tokens: in={result.input_tokens} out={result.output_tokens}")
+    emit(f"  suggested test command: {result.patch.suggested_test_command}")
+    emit("UNVERIFIED: the patch was not applied and no tests were run.")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.worker",
@@ -193,6 +354,14 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument(
         "--run-id", required=True, help="UUID of the run to inspect."
     )
+
+    propose_parser = subparsers.add_parser(
+        "propose",
+        help="Propose a patch for one inspected run using the configured model.",
+    )
+    propose_parser.add_argument(
+        "--run-id", required=True, help="UUID of an inspected ('ready') run."
+    )
     return parser
 
 
@@ -200,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "inspect":
         return inspect_run(args.run_id)
+    if args.command == "propose":
+        return propose_patch(args.run_id)
     return EXIT_OK  # pragma: no cover - argparse enforces a known command
 
 

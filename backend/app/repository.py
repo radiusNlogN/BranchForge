@@ -7,15 +7,21 @@ process can import this module without depending on FastAPI.
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
+    ATTEMPT_STATUS_FAILED,
+    ATTEMPT_STATUS_RUNNING,
+    ATTEMPT_STATUS_SUCCEEDED,
     RUN_STATUS_FAILED,
     RUN_STATUS_INSPECTING,
     RUN_STATUS_PENDING,
     RUN_STATUS_READY,
+    AttemptEvent,
     Inspection,
+    PatchAttempt,
     Run,
 )
 from app.time_utils import utcnow
@@ -148,3 +154,148 @@ def save_inspection_failure(
     db.commit()
     db.refresh(inspection)
     return inspection
+
+
+# --- Patch attempts ---------------------------------------------------------
+#
+# Note on run status: none of these functions touch `Run.status`. A run stays
+# `ready` — meaning its inspection succeeded — whether an attempt succeeds or
+# fails. Attempt state is tracked only on the attempt.
+
+
+def get_patch_attempt_for_run(db: Session, run_id: str) -> PatchAttempt | None:
+    return db.scalar(select(PatchAttempt).where(PatchAttempt.run_id == run_id))
+
+
+def list_attempt_events(db: Session, attempt_id: str, *, limit: int) -> list[AttemptEvent]:
+    """Events in order, capped."""
+    statement = (
+        select(AttemptEvent)
+        .where(AttemptEvent.attempt_id == attempt_id)
+        .order_by(AttemptEvent.seq)
+        .limit(limit)
+    )
+    return list(db.scalars(statement))
+
+
+def count_attempt_events(db: Session, attempt_id: str) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(AttemptEvent)
+            .where(AttemptEvent.attempt_id == attempt_id)
+        )
+        or 0
+    )
+
+
+def claim_patch_attempt(
+    db: Session, *, run_id: str, model: str, commit_sha: str | None
+) -> PatchAttempt | None:
+    """Create the attempt row, which *is* the claim.
+
+    `patch_attempts.run_id` is UNIQUE, so a second worker's INSERT violates the
+    constraint and this returns None — meaning that caller must not call the
+    model. Committed before any network work begins.
+    """
+    attempt = PatchAttempt(
+        run_id=run_id,
+        status=ATTEMPT_STATUS_RUNNING,
+        model=model,
+        commit_sha=commit_sha,
+    )
+    db.add(attempt)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return None
+    db.refresh(attempt)
+    return attempt
+
+
+def record_attempt_event(
+    db: Session,
+    *,
+    attempt_id: str,
+    kind: str,
+    summary: str,
+    detail: str | None,
+    max_events: int,
+    max_detail_chars: int,
+) -> None:
+    """Append one operational event in its own short transaction.
+
+    Committed immediately so the dashboard's Refresh shows progress while the
+    attempt is still running. Silently stops appending once `max_events` is
+    reached, so a long attempt cannot grow the table without bound.
+    """
+    existing = count_attempt_events(db, attempt_id)
+    if existing >= max_events:
+        return
+
+    db.add(
+        AttemptEvent(
+            attempt_id=attempt_id,
+            seq=existing + 1,
+            kind=kind[:40],
+            summary=summary[:max_detail_chars],
+            detail=detail[:max_detail_chars] if detail else None,
+        )
+    )
+    db.commit()
+
+
+def save_attempt_success(
+    db: Session,
+    *,
+    attempt_id: str,
+    diff: str,
+    summary: str,
+    suggested_test_command: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    max_summary_chars: int,
+    max_command_chars: int,
+) -> PatchAttempt:
+    """Store the patch and mark the attempt succeeded in one transaction."""
+    attempt = db.get(PatchAttempt, attempt_id)
+    if attempt is None:  # pragma: no cover - the caller just created it
+        raise ValueError(f"No patch attempt {attempt_id!r}.")
+
+    attempt.diff = diff
+    attempt.summary = summary[:max_summary_chars]
+    attempt.suggested_test_command = suggested_test_command[:max_command_chars]
+    attempt.input_tokens = input_tokens
+    attempt.output_tokens = output_tokens
+    attempt.status = ATTEMPT_STATUS_SUCCEEDED
+    attempt.completed_at = utcnow()
+    db.commit()
+    db.refresh(attempt)
+    return attempt
+
+
+def save_attempt_failure(
+    db: Session,
+    *,
+    attempt_id: str,
+    error_kind: str,
+    error_message: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    max_error_chars: int,
+) -> PatchAttempt:
+    """Record why the attempt failed, in one transaction."""
+    attempt = db.get(PatchAttempt, attempt_id)
+    if attempt is None:  # pragma: no cover
+        raise ValueError(f"No patch attempt {attempt_id!r}.")
+
+    attempt.status = ATTEMPT_STATUS_FAILED
+    attempt.error_kind = error_kind[:50]
+    attempt.error_message = error_message[:max_error_chars]
+    attempt.input_tokens = input_tokens
+    attempt.output_tokens = output_tokens
+    attempt.completed_at = utcnow()
+    db.commit()
+    db.refresh(attempt)
+    return attempt

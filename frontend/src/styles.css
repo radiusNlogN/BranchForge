@@ -20,6 +20,8 @@
   --pending: #e3b341;
   --inspecting: #58a6ff;
   --ready: #3fb950;
+  --diff-add: #3fb950;
+  --diff-del: #ff7b72;
   --danger: #ff6b6b;
   --danger-soft: rgba(255, 107, 107, 0.1);
   --info-soft: rgba(88, 166, 255, 0.08);
@@ -53,6 +55,8 @@
     --pending: #9a6c00;
     --inspecting: #0969da;
     --ready: #1a7f37;
+    --diff-add: #1a7f37;
+    --diff-del: #c62828;
     --danger: #c62828;
     --danger-soft: rgba(198, 40, 40, 0.07);
     --info-soft: rgba(9, 105, 218, 0.06);
@@ -937,4 +941,155 @@ textarea:disabled {
   gap: 12px;
   font-size: 12.5px;
   margin-bottom: 3px;
+}
+
+
+/* --- Patch attempt ------------------------------------------------------ */
+
+.inspection__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.badge--attempt-running {
+  color: var(--inspecting);
+  border-color: color-mix(in srgb, var(--inspecting) 35%, transparent);
+}
+
+.badge--attempt-running .badge__dot {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.badge--attempt-succeeded {
+  color: var(--ready);
+  border-color: color-mix(in srgb, var(--ready) 35%, transparent);
+}
+
+.badge--attempt-failed {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .badge--attempt-running .badge__dot { animation: none; }
+}
+
+/* The unverified warning sits immediately above the diff, never in a footer. */
+.unverified {
+  border: 1px solid var(--pending);
+  border-left-width: 3px;
+  background: color-mix(in srgb, var(--pending) 10%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+
+.diff {
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.diff__line {
+  display: block;
+  padding: 0 10px;
+  white-space: pre;
+}
+
+.diff__line--add {
+  color: var(--diff-add);
+  background: color-mix(in srgb, var(--diff-add) 12%, transparent);
+}
+
+.diff__line--del {
+  color: var(--diff-del);
+  background: color-mix(in srgb, var(--diff-del) 12%, transparent);
+}
+
+.diff__line--hunk {
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--inspecting) 10%, transparent);
+}
+
+.diff__line--file {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.attemptSummary {
+  margin: 0;
+  padding: 11px 12px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: event;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.events li {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 7px 11px;
+  font-size: 12px;
+}
+
+.events li + li {
+  border-top: 1px solid var(--border);
+}
+
+.events__kind {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  align-self: center;
+  overflow-wrap: anywhere;
+}
+
+.events__kind--patch_submitted { color: var(--ready); }
+.events__kind--tool_error,
+.events__kind--patch_rejected,
+.events__kind--batch_rejected,
+.events__kind--tool_unknown { color: var(--danger); }
+
+.events__summary {
+  overflow-wrap: anywhere;
+}
+
+.events__detail {
+  grid-column: 2;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+  .events li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .events__detail { grid-column: 1; }
 }

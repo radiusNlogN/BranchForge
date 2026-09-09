@@ -3,6 +3,7 @@ import { formatAbsolute, formatRelative } from "../time";
 import { Callout } from "./Callout";
 import { InspectionPanel } from "./InspectionPanel";
 import { NotImplementedNote } from "./NotImplementedNote";
+import { PatchAttemptPanel } from "./PatchAttemptPanel";
 import { StatusBadge } from "./StatusBadge";
 
 interface RunDetailProps {
@@ -114,6 +115,14 @@ export function RunDetail({
             runId={run.id}
             status={run.status}
             inspection={run.inspection}
+            refreshing={loading}
+            onRefresh={onRefresh}
+          />
+
+          <PatchAttemptPanel
+            runId={run.id}
+            runStatus={run.status}
+            attempt={run.patch_attempt}
             refreshing={loading}
             onRefresh={onRefresh}
           />

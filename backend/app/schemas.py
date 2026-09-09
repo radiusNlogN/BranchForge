@@ -14,6 +14,9 @@ from pydantic import (
 )
 
 from app.models import (
+    ATTEMPT_STATUS_FAILED,
+    ATTEMPT_STATUS_RUNNING,
+    ATTEMPT_STATUS_SUCCEEDED,
     MAX_PARALLEL_ATTEMPTS,
     MIN_PARALLEL_ATTEMPTS,
     RUN_STATUS_FAILED,
@@ -195,14 +198,74 @@ class InspectionRead(BaseModel):
         return to_iso_utc(value) if value is not None else None
 
 
-class RunDetailRead(RunRead):
-    """A run plus its inspection, for the detail view.
+# --- Patch attempt ----------------------------------------------------------
 
-    The list endpoint deliberately returns `RunRead` without this — inspections
-    would make a list response unbounded.
+
+class AttemptStatus(str, Enum):
+    """Patch-attempt states, independent of the run's own status."""
+
+    RUNNING = ATTEMPT_STATUS_RUNNING
+    SUCCEEDED = ATTEMPT_STATUS_SUCCEEDED
+    FAILED = ATTEMPT_STATUS_FAILED
+
+
+class AttemptEventRead(BaseModel):
+    """One operational event. Never contains model reasoning."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    seq: int
+    kind: str
+    summary: str
+    detail: str | None
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def _serialize_timestamp(self, value: datetime) -> str:
+        return to_iso_utc(value)
+
+
+class PatchAttemptRead(BaseModel):
+    """A persisted patch attempt.
+
+    The diff is an UNVERIFIED proposal: it was never applied and no tests were
+    run. `events` is capped; `events_total` reports how many exist.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    status: AttemptStatus
+    model: str
+    commit_sha: str | None
+    diff: str | None
+    summary: str | None
+    suggested_test_command: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    error_kind: str | None
+    error_message: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+    events: list[AttemptEventRead] = Field(default_factory=list)
+    events_total: int = 0
+
+    @field_serializer("started_at", "completed_at")
+    def _serialize_timestamp(self, value: datetime | None) -> str | None:
+        return to_iso_utc(value) if value is not None else None
+
+
+class RunDetailRead(RunRead):
+    """A run plus its inspection and patch attempt, for the detail view.
+
+    The list endpoint deliberately returns `RunRead` without these — they would
+    make a list response unbounded.
     """
 
     inspection: InspectionRead | None = None
+    patch_attempt: PatchAttemptRead | None = None
 
 
 class HealthRead(BaseModel):

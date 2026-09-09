@@ -5,23 +5,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project scope — read this first
 
 BranchForge will eventually investigate GitHub issues by running competing agent-generated fixes in
-isolated environments. **Milestones 1 and 2 exist: run intake, and read-only repository
-inspection.** A run is stored `pending`; a separate worker claims it and inspects the repository
-through the GitHub API, ending at `ready` or `failed`.
+isolated environments. **Milestones 1-3 exist: run intake, read-only repository inspection, and one
+bounded patch-proposal agent.** A run is stored `pending`; `worker inspect` moves it to
+`ready`/`failed`; `worker propose` then runs one agent that proposes a patch.
 
-**`ready` means the inspection finished — not that a fix exists.**
+**`ready` means the inspection finished. A proposed patch is UNVERIFIED** — validated for diff
+syntax only, never applied, compiled, or tested.
 
 Deliberately absent — do not add these while working on unrelated tasks:
-LLM/agent integration, patch generation, test execution, repository cloning or code execution,
-sandboxing, scheduling or polling, crash recovery for stuck runs, authentication, deployment
-tooling.
+patch application, test execution, repository cloning or code execution, sandboxing, competing
+parallel agents, context compaction, retries, crash recovery for stuck runs/attempts, scheduling or
+polling, authentication, deployment tooling.
 
 **Never add simulated agent activity or fabricated results** — no fake progress bars, spinners
-implying work that isn't happening, placeholder attempt rows, or invented patch output. The UI's
-honesty about what does not work yet is load-bearing, concentrated in
-`frontend/src/components/NotImplementedNote.tsx`. When a milestone changes what is true, that text
-is a **correctness** change, not copy editing: milestone 2 made the old "does not contact GitHub"
-claim false. Keep it, the README scope paragraph, and this section in sync.
+implying work that isn't happening, placeholder attempt rows, or invented patch output. Never
+fabricate token counts or costs: `input_tokens`/`output_tokens` come from the provider and stay
+`NULL` when unavailable. The UI's honesty about what does not work yet is load-bearing, concentrated
+in `frontend/src/components/NotImplementedNote.tsx`. When a milestone changes what is true, that text
+is a **correctness** change, not copy editing: milestone 2 falsified "does not contact GitHub", and
+milestone 3 falsified "does not call any AI model". Keep it, the README scope paragraph, and this
+section in sync.
 
 ## Commands
 
@@ -43,12 +46,15 @@ uv run pytest tests/test_runs_api.py                                  # one file
 uv run pytest tests/test_runs_api.py::test_unknown_run_id_returns_404  # one test
 uv run pytest -k "validator and reject"                                # by expression
 
-# Inspection worker (separate process; same DATABASE_URL as the API)
-uv run python -m app.worker inspect --run-id <UUID>
+# Workers (separate processes; same DATABASE_URL as the API)
+uv run python -m app.worker inspect --run-id <UUID>   # pending -> ready | failed
+uv run python -m app.worker propose --run-id <UUID>   # needs ANTHROPIC_API_KEY
 ```
 
-Exit codes: `0` inspected, `1` inspection failed (recorded on the run), `2` no such run, `3` not
-claimable. Only a `pending` run can be claimed, so a run is inspected at most once.
+`inspect` exit codes: `0` ok, `1` failed (recorded on the run), `2` no such run, `3` not claimable.
+`propose` exit codes: `0` ok, `1` attempt failed (recorded on the attempt), `2` no such run, `3` the
+run already has an attempt, `4` the run is not `ready`, `5` model not configured (**no attempt row is
+created**). Each step happens at most once per run.
 
 ```bash
 # Frontend setup, dev server → http://localhost:5173
@@ -69,6 +75,22 @@ uv run alembic revision --autogenerate -m "description"
 uv run alembic upgrade head
 uv run alembic current
 ```
+
+### Test suite shape
+
+146 tests, all offline. Two mocking boundaries, and new tests should reuse them rather than invent a
+third:
+
+- **GitHub** is mocked at the *transport* layer (`FakeGitHub` in `tests/conftest.py` →
+  `httpx2.MockTransport`), so real URL construction, byte caps, and status handling execute.
+- **The model** is mocked at the *interface* layer (`ScriptedModelClient`), which replays canned
+  `ModelTurn`s and records the message history it was sent — use `.seen_messages` and
+  `.last_tool_results()` for assertions.
+
+**Never add a test that reaches the network or spends API credit.** Live checks are manual commands
+documented in the README. Contention tests use a barrier plus *independent* engines against one
+temporary file database (`tests/test_claim.py`, `tests/test_attempt_claim.py`); that pattern has teeth
+— a naive read-then-write claim produces two winners under it.
 
 ### Verifying without destroying the dev database
 
@@ -201,19 +223,78 @@ The submit guard clears in a `finally` block so a failed request cannot leave th
 disabled. Per-field server errors are cleared when the user edits that field (`handleEdit` in
 `NewRunForm.tsx`, wired to `dismissFieldError` in `App.tsx`), so stale messages don't linger.
 
+### The agent loop (milestone 3)
+
+`app/agent.py` is a hand-written controller loop, deliberately **not** the SDK's tool runner, because
+the Python side must validate and dispatch every tool call. Invariants to preserve:
+
+- **Two tools only**: `read_file(path)` and `submit_patch(diff, summary, suggested_test_command)`.
+  The commit SHA comes from the persisted inspection — the model cannot change which commit is read,
+  which is what keeps the inspection immutable. Paths reuse `github_client`'s traversal rejections.
+- **`submit_patch` must be the only call in its response.** A response mixing it with reads, or
+  containing two submissions, is rejected wholesale with one `is_error` tool_result **per tool_use
+  id**, and the model may correct itself within remaining budgets. Ordinary read batches also return
+  one result per id, all in a single user message.
+- **A `max_tokens` response is rejected before its tool calls run** — the arguments may be truncated.
+- **Never mark an incomplete conversation successful.** Budget exhaustion, provider failure, refusal,
+  and "ended without a patch" are all recorded failures with their own `error_kind`.
+- **Context is measured, never estimated**: `count_input_tokens` (behind the model interface, so
+  tests need no network) is called before every generation with system + tools + full history. Over
+  budget ⇒ terminate with an explanation. **Never drop or summarize messages** — compaction is a
+  later milestone.
+- **Cache reads per attempt**, seeded from inspection previews that are *complete*; a truncated
+  preview is re-fetched rather than served as if whole.
+- Events record operational facts only — never model reasoning, and never thinking-block content,
+  even though thinking blocks are echoed back in the conversation verbatim.
+
+`app/patch_validation.py` runs even though the tool schema is `strict: true`: a schema constrains
+argument shape, not diff validity. It checks hunk line counts, rejects absolute/`..` paths, and
+refuses binary patches, renames, and copies. **Passing validation is not evidence the patch applies
+or works** — keep the unverified framing everywhere.
+
+### Anthropic SDK facts (verified against the live API, not recalled)
+
+**Before changing anything that calls the model, load the `claude-api` skill** rather than working
+from memory — this API has drifted repeatedly (thinking config, structured outputs, prefill removal).
+The notes below were confirmed by real calls in this repository and are safe to rely on:
+
+- `anthropic` 1.x is built on **`httpx2`**, not `httpx`; `anthropic.Timeout` *is* `httpx2.Timeout`.
+- Echoing assistant turns back as `[block.model_dump() for block in response.content]` **is accepted**
+  on replay, thinking blocks included. That is why `ModelTurn.assistant_content` holds dicts.
+- `client.messages.count_tokens(model=, system=, tools=, messages=)` works and returns
+  `.input_tokens`. This is the measured context accounting the agent relies on.
+- `claude-opus-5` reports `max_input_tokens=1,000,000` and `max_tokens=128,000` via
+  `client.models.retrieve(...)`, which is where `AGENT_MODEL_CONTEXT_TOKENS` comes from.
+- Thinking is **adaptive by default** on this model with `display: "omitted"`, so `thinking` blocks
+  arrive with empty text and must still be echoed back unchanged. Do not persist their content.
+- **Use the exact model ID string** (`claude-opus-5`). Never append a date suffix, and never invent an
+  identifier — `ANTHROPIC_MODEL` exists so the user picks.
+- `stop_reason` values the loop handles: `tool_use`, `end_turn`, `max_tokens`, `refusal`.
+
 ## Frontend rules
 
 - **Never `dangerouslySetInnerHTML`, and no markdown-to-HTML library.** Repository text renders as
   plain `{content}` inside `<pre>`; React escapes it. A "render the README nicely" request must not
   change this.
 - Collapsible previews use native `<details>`/`<summary>` — no JS, accessible by default.
-- There is no polling. Refresh is a manual button, because nothing schedules the worker.
+- There is no polling. Refresh is a manual button, because nothing schedules the workers.
+- The diff is model output: render it as plain text. `PatchAttemptPanel` classifies lines for colour
+  by inspecting the first character and emitting React elements — never by generating HTML. Do not
+  add a syntax-highlighting or markdown library here.
+- **"Unverified patch — not applied or tested" must stay adjacent to the diff**, not in a footer.
+- The suggested test command is display-only. Do not add a run button or anything that reads as
+  executable.
 
 ## Constraints on dependencies
 
 - **`httpx2` is httpx v2**, and installs under the module name `httpx2` — which is why imports read
-  `import httpx2` and `import httpx` fails. It is a runtime dependency (the worker) *and* what
-  Starlette's `TestClient` wants. Do not add the older `httpx` package alongside it.
+  `import httpx2` and `import httpx` fails. Three things want it: the GitHub client, Starlette's
+  `TestClient`, and `anthropic` 1.x (whose `anthropic.Timeout` *is* `httpx2.Timeout`). Do not add the
+  older `httpx` package alongside it.
+- **`anthropic` SDK**: retries are disabled (`max_retries=0`) so a transparent retry cannot re-spend
+  an attempt's budget. The request timeout is per HTTP request, **not** a whole-attempt deadline.
+- **Credentials**: the key is a `SecretStr` in settings, read from `ANTHROPIC_API_KEY`. Never log it,
+  persist it, or return it. Leakage tests use a synthetic sentinel value — never the real key.
 
 - **Vite is pinned to the 6 line on purpose.** Vite 7+ and `@vitejs/plugin-react` 5+ require Node
   `^20.19.0 || >=22.12.0`; this environment has Node 20.10.0. `package.json`'s `engines.node`
@@ -235,16 +316,25 @@ would otherwise require JSON for a list-typed field.
 **`RUN_LIST_MAX_LIMIT` must stay ≥ 25**: the dashboard requests 25 runs per list call, so a lower
 ceiling makes every list request fail with a 422.
 
-## Status enum touches four places
+## Two status enums, each spanning four places
 
-`pending → inspecting → ready | failed`, defined in `app/models.py` (`RUN_STATUS_*`) and
-`app/schemas.py` (`RunStatus`), mirrored in `frontend/src/types.ts`, and styled in
-`StatusBadge.tsx`. `types.ts`'s `RunStatus` is a **literal union**, so a new status arriving from the
-API against a stale type is a runtime mismatch `tsc` cannot catch. Update all four together.
+Both are **literal unions** in `frontend/src/types.ts`, so a new value arriving from the API against a
+stale type is a runtime mismatch `tsc` cannot catch. Update all four places together.
+
+| Enum | Values | Defined in | Mirrored in | Styled in |
+|---|---|---|---|---|
+| Run | `pending → inspecting → ready \| failed` | `models.py` `RUN_STATUS_*`, `schemas.py` `RunStatus` | `types.ts` `RunStatus` | `StatusBadge.tsx` |
+| Attempt | `running → succeeded \| failed` | `models.py` `ATTEMPT_STATUS_*`, `schemas.py` `AttemptStatus` | `types.ts` `AttemptStatus` | `PatchAttemptPanel.tsx` |
+
+They are independent on purpose — see the note under Database schema.
 
 ## Database schema
 
-Two migrations: `0001` (runs), `0002` (inspections, FK to `runs.id` with `ON DELETE CASCADE`, unique
-`run_id` — one inspection per run). `app/database.py` sets `PRAGMA foreign_keys=ON` for every SQLite
+Three migrations: `0001` (runs), `0002` (inspections), `0003` (`patch_attempts` + `attempt_events`).
+Every child FK is `ON DELETE CASCADE`; `inspections.run_id` and `patch_attempts.run_id` are both
+`UNIQUE` (one each per run). `app/database.py` sets `PRAGMA foreign_keys=ON` for every SQLite
 connection via an `Engine` `"connect"` listener, so foreign keys are genuinely enforced for the API,
-the worker, and the tests. `tests/test_migrations.py` asserts that.
+the workers, and the tests. `tests/test_migrations.py` asserts all of it.
+
+**Run status vs attempt status.** `Run.status` describes inspection only. A run stays `ready` whether
+a patch attempt succeeds or fails — no attempt code path may write `Run.status`.

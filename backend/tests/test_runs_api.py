@@ -308,3 +308,112 @@ def test_list_endpoint_does_not_include_inspections(
     assert listed[0]["id"] == run_id
     assert listed[0]["status"] == "ready"
     assert "inspection" not in listed[0]
+
+
+# --- Patch attempt exposed through run detail --------------------------------
+
+
+def _propose(run_id, session_factory, model, github):
+    from tests.conftest import agent_settings
+
+    return worker.propose_patch(
+        run_id,
+        session_factory=session_factory,
+        client_factory=github.client_factory,
+        model_factory=model.factory,
+        config=agent_settings(),
+    )
+
+
+def _inspected(client: TestClient, session_factory, fake_github, worker_settings) -> str:
+    from tests.conftest import INSPECTABLE_PAYLOAD
+
+    run_id = client.post("/api/runs", json=INSPECTABLE_PAYLOAD).json()["id"]
+    worker.inspect_run(
+        run_id,
+        session_factory=session_factory,
+        client_factory=fake_github.client_factory,
+        config=worker_settings,
+    )
+    return run_id
+
+
+def test_run_detail_has_null_attempt_before_proposing(
+    client: TestClient, session_factory, fake_github, worker_settings
+) -> None:
+    run_id = _inspected(client, session_factory, fake_github, worker_settings)
+    body = client.get(f"/api/runs/{run_id}").json()
+    assert body["status"] == "ready"
+    assert body["inspection"] is not None
+    assert body["patch_attempt"] is None
+
+
+def test_run_detail_returns_the_persisted_patch_and_events(
+    client: TestClient, session_factory, fake_github, worker_settings
+) -> None:
+    from tests.conftest import (
+        VALID_DIFF,
+        FakeGitHub,
+        ScriptedModelClient,
+        make_turn,
+        read_call,
+        submit_call,
+    )
+
+    run_id = _inspected(client, session_factory, fake_github, worker_settings)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[read_call("a.py")]),
+        make_turn(tool_calls=[submit_call()]),
+    ])
+    assert _propose(run_id, session_factory, model, FakeGitHub(files={"a.py": "1\n"})) == 0
+
+    body = client.get(f"/api/runs/{run_id}").json()
+    # The run itself is untouched: `ready` still means inspection succeeded.
+    assert body["status"] == "ready"
+
+    attempt = body["patch_attempt"]
+    assert attempt["status"] == "succeeded"
+    assert attempt["run_id"] == run_id
+    assert attempt["model"] == "scripted-model-1"
+    assert attempt["diff"] == VALID_DIFF
+    assert attempt["summary"].startswith("Guard against")
+    assert attempt["suggested_test_command"] == "pytest tests/test_signer.py"
+    assert attempt["input_tokens"] == 200 and attempt["output_tokens"] == 100
+    assert attempt["error_kind"] is None
+    assert attempt["started_at"].endswith("Z") and attempt["completed_at"].endswith("Z")
+
+    events = attempt["events"]
+    assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
+    assert {"file_read", "patch_submitted"} <= {e["kind"] for e in events}
+    assert attempt["events_total"] == len(events)
+
+
+def test_failed_attempt_is_visible_and_run_stays_ready(
+    client: TestClient, session_factory, fake_github, worker_settings
+) -> None:
+    from tests.conftest import FakeGitHub, ScriptedModelClient, make_turn
+
+    run_id = _inspected(client, session_factory, fake_github, worker_settings)
+    model = ScriptedModelClient([make_turn(text="No safe fix found.")])
+    assert _propose(run_id, session_factory, model, FakeGitHub()) == 1
+
+    body = client.get(f"/api/runs/{run_id}").json()
+    assert body["status"] == "ready"
+    assert body["patch_attempt"]["status"] == "failed"
+    assert body["patch_attempt"]["error_kind"] == "finished_without_patch"
+    assert body["patch_attempt"]["diff"] is None
+
+
+def test_list_endpoint_excludes_patch_attempts(
+    client: TestClient, session_factory, fake_github, worker_settings
+) -> None:
+    from tests.conftest import FakeGitHub, ScriptedModelClient, make_turn, submit_call
+
+    run_id = _inspected(client, session_factory, fake_github, worker_settings)
+    model = ScriptedModelClient([make_turn(tool_calls=[submit_call()])])
+    _propose(run_id, session_factory, model, FakeGitHub())
+
+    listed = client.get("/api/runs").json()
+    assert listed[0]["id"] == run_id
+    assert "patch_attempt" not in listed[0]
+    assert "inspection" not in listed[0]

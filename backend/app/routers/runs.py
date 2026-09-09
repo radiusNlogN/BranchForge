@@ -12,7 +12,14 @@ from sqlalchemy.orm import Session
 from app import repository
 from app.config import settings
 from app.database import get_db
-from app.schemas import InspectionRead, RunCreate, RunDetailRead, RunRead
+from app.schemas import (
+    AttemptEventRead,
+    InspectionRead,
+    PatchAttemptRead,
+    RunCreate,
+    RunDetailRead,
+    RunRead,
+)
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -54,10 +61,11 @@ def get_run(
     run_id: str = Path(description="Server-generated run UUID."),
     db: Session = Depends(get_db),
 ) -> RunDetailRead:
-    """Return one run together with its inspection, or 404 if unknown.
+    """Return one run with its inspection and patch attempt, or 404 if unknown.
 
-    The inspection is `null` until the worker has run. The response stays bounded
-    because the worker's budgets bound the report when it is written.
+    Both are `null` until the corresponding worker command has run. The response
+    stays bounded because the workers' budgets bound what they write, and the
+    attempt's event list is capped here as well.
     """
     run = repository.get_run(db, run_id)
     if run is None:
@@ -66,8 +74,21 @@ def get_run(
             detail=f"No run found with id {run_id!r}.",
         )
 
-    inspection = repository.get_inspection_for_run(db, run_id)
     detail = RunDetailRead.model_validate(run)
+
+    inspection = repository.get_inspection_for_run(db, run_id)
     if inspection is not None:
         detail.inspection = InspectionRead.model_validate(inspection)
+
+    attempt = repository.get_patch_attempt_for_run(db, run_id)
+    if attempt is not None:
+        events = repository.list_attempt_events(
+            db, attempt.id, limit=settings.agent_max_events
+        )
+        detail.patch_attempt = PatchAttemptRead.model_validate(attempt)
+        detail.patch_attempt.events = [
+            AttemptEventRead.model_validate(event) for event in events
+        ]
+        detail.patch_attempt.events_total = repository.count_attempt_events(db, attempt.id)
+
     return detail

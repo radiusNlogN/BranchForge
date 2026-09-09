@@ -150,6 +150,123 @@ def select_files(blobs: list[dict[str, Any]], *, max_files: int) -> tuple[dict[s
     return readme, configs
 
 
+@dataclass(frozen=True)
+class FetchedText:
+    """The outcome of one bounded file read.
+
+    `text` is None when the file could not be stored, and `problem` says why.
+    `truncated` marks content cut to fit a budget, which callers must keep
+    distinct from complete content.
+    """
+
+    path: str
+    text: str | None
+    byte_size: int | None
+    truncated: bool = False
+    is_binary: bool = False
+    problem: str | None = None
+
+
+def fetch_text_file(
+    client: GitHubClient,
+    ref: RepositoryRef,
+    path: str,
+    commit_sha: str,
+    *,
+    declared_size: int | None,
+    max_file_bytes: int,
+    remaining_total: int,
+) -> FetchedText:
+    """Read one text file at `commit_sha`, bounded at every step.
+
+    Shared by the inspection worker and the patch agent. The tree's declared size
+    is checked first so an oversized file costs no request and is never decoded.
+    """
+    if isinstance(declared_size, int) and declared_size > max_file_bytes:
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=declared_size,
+            problem=(
+                f"Not fetched: {declared_size:,} bytes exceeds the "
+                f"{max_file_bytes:,}-byte per-file limit."
+            ),
+        )
+
+    if remaining_total <= 0:
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=declared_size if isinstance(declared_size, int) else None,
+            problem="Not fetched: the total content budget was already used.",
+        )
+
+    payload = client.get_file(ref.owner, ref.repo, path, commit_sha)
+
+    reported = payload.get("size")
+    if isinstance(reported, int) and reported > max_file_bytes:
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=reported,
+            problem=(
+                f"Discarded before decoding: {reported:,} bytes exceeds the "
+                f"{max_file_bytes:,}-byte per-file limit."
+            ),
+        )
+
+    encoded = payload.get("content")
+    if payload.get("encoding") != "base64" or not isinstance(encoded, str):
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=reported if isinstance(reported, int) else None,
+            problem="Not stored: GitHub did not return base64 content.",
+        )
+
+    try:
+        raw = base64.b64decode(encoded, validate=False)
+    except (ValueError, TypeError):
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=reported if isinstance(reported, int) else None,
+            problem="Not stored: content was not valid base64.",
+        )
+
+    if len(raw) > max_file_bytes:
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=len(raw),
+            problem=(
+                f"Discarded: decoded to {len(raw):,} bytes, over the "
+                f"{max_file_bytes:,}-byte per-file limit."
+            ),
+        )
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return FetchedText(
+            path=path,
+            text=None,
+            byte_size=len(raw),
+            is_binary=True,
+            problem="Not stored: file is not UTF-8 text.",
+        )
+
+    text = _sanitize_text(text)
+    truncated = False
+    if len(text.encode("utf-8")) > remaining_total:
+        text = text.encode("utf-8")[:remaining_total].decode("utf-8", errors="ignore")
+        truncated = True
+
+    return FetchedText(
+        path=path, text=text, byte_size=len(raw), truncated=truncated
+    )
+
+
 def _fetch_preview(
     client: GitHubClient,
     ref: RepositoryRef,
@@ -159,123 +276,38 @@ def _fetch_preview(
     max_file_bytes: int,
     remaining_total: int,
 ) -> tuple[FilePreview, int]:
-    """Fetch one file, or omit it without fetching when it cannot fit.
-
-    The tree's own `size` is checked first, so an oversized file costs no request
-    and is never decoded.
-    """
+    """Adapt a bounded file read into a report preview."""
     path = entry["path"]
-    declared = entry.get("size")
+    fetched = fetch_text_file(
+        client,
+        ref,
+        path,
+        commit_sha,
+        declared_size=entry.get("size") if isinstance(entry.get("size"), int) else None,
+        max_file_bytes=max_file_bytes,
+        remaining_total=remaining_total,
+    )
 
-    if isinstance(declared, int) and declared > max_file_bytes:
+    if fetched.text is None:
         return (
             FilePreview(
                 path=path,
-                size=declared,
+                size=fetched.byte_size,
                 omitted=True,
-                omitted_reason=(
-                    f"Not fetched: {declared:,} bytes exceeds the "
-                    f"{max_file_bytes:,}-byte per-file limit."
-                ),
+                omitted_reason=fetched.problem,
+                is_binary=fetched.is_binary,
             ),
             0,
         )
 
-    if remaining_total <= 0:
-        return (
-            FilePreview(
-                path=path,
-                size=declared if isinstance(declared, int) else None,
-                omitted=True,
-                omitted_reason="Not fetched: the total content budget was already used.",
-            ),
-            0,
-        )
-
-    payload = client.get_file(ref.owner, ref.repo, path, commit_sha)
-
-    reported_size = payload.get("size")
-    if isinstance(reported_size, int) and reported_size > max_file_bytes:
-        return (
-            FilePreview(
-                path=path,
-                size=reported_size,
-                omitted=True,
-                omitted_reason=(
-                    f"Discarded before decoding: {reported_size:,} bytes exceeds the "
-                    f"{max_file_bytes:,}-byte per-file limit."
-                ),
-            ),
-            0,
-        )
-
-    encoded = payload.get("content")
-    if payload.get("encoding") != "base64" or not isinstance(encoded, str):
-        return (
-            FilePreview(
-                path=path,
-                size=reported_size if isinstance(reported_size, int) else None,
-                omitted=True,
-                omitted_reason="Not stored: GitHub did not return base64 content.",
-            ),
-            0,
-        )
-
-    try:
-        raw = base64.b64decode(encoded, validate=False)
-    except (ValueError, TypeError):
-        return (
-            FilePreview(
-                path=path,
-                size=reported_size if isinstance(reported_size, int) else None,
-                omitted=True,
-                omitted_reason="Not stored: content was not valid base64.",
-            ),
-            0,
-        )
-
-    if len(raw) > max_file_bytes:
-        return (
-            FilePreview(
-                path=path,
-                size=len(raw),
-                omitted=True,
-                omitted_reason=(
-                    f"Discarded: decoded to {len(raw):,} bytes, over the "
-                    f"{max_file_bytes:,}-byte per-file limit."
-                ),
-            ),
-            0,
-        )
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return (
-            FilePreview(
-                path=path,
-                size=len(raw),
-                is_binary=True,
-                omitted=True,
-                omitted_reason="Not stored: file is not UTF-8 text.",
-            ),
-            0,
-        )
-
-    text = _sanitize_text(text)
-    truncated = False
-    if len(text.encode("utf-8")) > remaining_total:
-        text = text.encode("utf-8")[:remaining_total].decode("utf-8", errors="ignore")
-        truncated = True
-
-    stored = len(text.encode("utf-8"))
+    stored = len(fetched.text.encode("utf-8"))
     return (
         FilePreview(
             path=path,
-            size=len(raw),
-            content=text,
+            size=fetched.byte_size,
+            content=fetched.text,
             bytes_shown=stored,
-            content_truncated=truncated,
+            content_truncated=fetched.truncated,
         ),
         stored,
     )

@@ -1,16 +1,17 @@
 /**
  * The honest scope statement.
  *
- * Milestone 2 added real GitHub inspection, so the earlier claim that BranchForge
- * "does not contact GitHub" is no longer true. Keep this text matching what the
- * code actually does — stale honesty text is worse than none.
+ * Milestone 3 added real model calls and patch proposals, so the milestone-2
+ * claim that BranchForge "does not call any AI model" is no longer true. Keep
+ * this text matching what the code actually does — stale honesty text is worse
+ * than none.
  */
 export function NotImplementedNote({ compact = false }: { compact?: boolean }) {
   if (compact) {
     return (
       <p className="note note--compact">
-        Inspection is read-only. No fix has been attempted — AI fixes and test execution are not
-        implemented yet.
+        Inspection is read-only. Any proposed patch is unverified — nothing is applied and no tests
+        are run.
       </p>
     );
   }
@@ -18,19 +19,19 @@ export function NotImplementedNote({ compact = false }: { compact?: boolean }) {
   return (
     <div className="note">
       <p>
-        <strong>Milestone 2: repository inspection.</strong> Creating a run stores it as{" "}
-        <code>pending</code>. A separate worker command then reads the repository through the GitHub
-        API and saves an inspection report, moving the run to <code>ready</code> or{" "}
-        <code>failed</code>.
+        <strong>Milestone 3: inspect a repository, then propose a patch.</strong> Creating a run
+        stores it as <code>pending</code>. One worker command inspects the repository through the
+        GitHub API; a second runs a single bounded agent that reads the issue and the inspection and
+        proposes a patch.
       </p>
       <p>
-        <strong>&ldquo;Ready&rdquo; means the inspection finished, not that a fix exists.</strong>{" "}
-        BranchForge does not yet call any AI model, generate patches, or run tests, and nothing is
-        simulated. Inspection is strictly read-only: the repository is never cloned, its
-        dependencies are never installed, and its code is never executed.
+        <strong>Any patch shown here is unverified.</strong> It is checked only for valid
+        unified-diff syntax. BranchForge does not apply it, compile it, or run any tests, and it
+        never clones the repository or executes repository code. Competing parallel attempts,
+        sandboxed verification, and applying patches are not implemented.
       </p>
       <p>
-        Runs are not scheduled automatically — you run the worker yourself, then refresh.
+        Nothing is scheduled — you run each worker command yourself, then refresh.
       </p>
     </div>
   );

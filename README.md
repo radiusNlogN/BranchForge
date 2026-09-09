@@ -3,15 +3,15 @@
 BranchForge investigates GitHub issues by running competing agent-generated fixes in isolated
 environments and presenting verified patches.
 
-**This repository currently contains milestones 1 and 2: run intake, and read-only repository
-inspection.** A run is validated and stored as `pending`. A separate worker command then reads the
-repository through the GitHub API and saves an inspection report, moving the run to `ready` or
-`failed`.
+**This repository currently contains milestones 1-3: run intake, read-only repository inspection,
+and one bounded patch-proposal agent.** A run is stored as `pending`; one worker command inspects the
+repository through the GitHub API (`ready`/`failed`); a second runs a single agent that reads the
+issue and the inspection, requests further files, and proposes a patch.
 
-**"Ready" means the inspection finished — not that a fix exists.** There are no model calls, no
-generated patches, and no test execution. Inspection is strictly read-only: the repository is never
-cloned, its dependencies are never installed, and its code is never executed. Nothing is scheduled
-automatically and no progress or results are simulated.
+**Any proposed patch is unverified.** It is checked only for valid unified-diff syntax. BranchForge
+never applies it, compiles it, or runs tests, and never clones the repository or executes repository
+code. Competing parallel attempts and sandboxed verification are not implemented. Nothing is
+scheduled automatically and no progress or results are simulated.
 
 ---
 
@@ -25,6 +25,7 @@ automatically and no progress or results are simulated.
 - [Verification](#verification)
 - [API](#api)
 - [GitHub rate limits](#github-rate-limits)
+- [Model configuration and budgets](#model-configuration-and-budgets)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 - [Design notes](#design-notes)
@@ -47,6 +48,13 @@ automatically and no progress or results are simulated.
   stored as readable errors against the run.
 - The dashboard displays the persisted report with collapsible previews, truncation notices, and a
   manual Refresh button.
+- A second worker command runs one bounded agent against an inspected run: it reads the issue and the
+  inspection, can request further files from the same immutable commit with a `read_file` tool, and
+  finishes by submitting a unified diff, an explanation, and a suggested test command.
+- Submissions are validated locally — diff syntax, hunk line counts, path safety — and a rejected
+  submission is returned to the model as a tool error so it can correct itself within its budgets.
+- Attempt activity is stored as ordered events and shown in the dashboard beside the diff, under a
+  prominent "unverified" label.
 
 ## The workflow
 
@@ -65,7 +73,10 @@ curl -X POST http://localhost:8000/api/runs \
 cd backend
 uv run python -m app.worker inspect --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
 
-# 3. Refresh the run's detail view in the dashboard (or GET /api/runs/<id>)
+# 3. Propose a patch (needs ANTHROPIC_API_KEY)
+uv run python -m app.worker propose --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
+
+# 4. Refresh the run's detail view in the dashboard (or GET /api/runs/<id>)
 ```
 
 The worker prints what it did:
@@ -79,12 +90,34 @@ Inspected itsdangerous at 672971d66a2e on main
 Run 64fbb850-784e-44fa-8c73-9e0dce94c339 -> ready (inspection complete; no fix attempted)
 ```
 
-Exit codes: `0` inspected, `1` inspection failed (recorded against the run), `2` no such run,
-`3` the run was not claimable (already inspecting, finished, or taken by another worker).
+`inspect` exit codes: `0` inspected, `1` inspection failed (recorded against the run), `2` no such
+run, `3` not claimable (already inspecting, finished, or taken by another worker).
 
-Only a `pending` run can be claimed, so a run is inspected at most once. The claim is a single
-conditional `UPDATE`, so two workers racing for the same run cannot both win — the loser exits
-without contacting GitHub.
+`propose` exit codes: `0` patch proposed, `1` the attempt failed (recorded against the attempt),
+`2` no such run, `3` the run already has an attempt, `4` the run is not `ready`, `5` the model is not
+configured — in which case **no attempt row is created at all**.
+
+Only a `pending` run can be inspected, and only a `ready` run can be proposed for, so each step
+happens at most once per run. Both claims are race-safe: inspection uses a conditional `UPDATE`, and
+an attempt is claimed by inserting a row whose `run_id` is `UNIQUE`. In both cases the losing worker
+exits without contacting GitHub or the model.
+
+A successful `propose` prints what the agent did, for example:
+
+```
+Claimed patch attempt for run 08bd92bc-…
+Model: claude-opus-5 | commit 672971d66a2ef9f85151e53283113f33d642dabd
+Proposing a patch (read-only; nothing is applied or executed)
+  · Seeded 2 file(s) from the inspection
+  · Context: 4,935 of 976,000 input tokens
+  · Model turn 1 (tool_use)
+  · Read src/itsdangerous/signer.py
+  …
+  · Patch submitted touching 2 file(s)
+Proposed a patch touching 2 file(s): src/itsdangerous/signer.py, CHANGES.rst
+  tokens: in=105557 out=7602
+UNVERIFIED: the patch was not applied and no tests were run.
+```
 
 ## Requirements
 
@@ -179,6 +212,37 @@ secondary rate limiting, timeouts, malformed JSON, refused redirects, an invalid
 truncated tree, an oversized response body, an oversized file omitted without being fetched, request
 budgets, and claim contention between two independent database connections.
 
+### Agent tests
+
+`tests/test_agent.py` and `tests/test_attempt_claim.py` drive the real controller loop with scripted
+model turns and mocked GitHub — no network, no API spend. They cover the read-then-submit path, cache
+reuse (asserting no GitHub request), cache seeding from complete-but-not-truncated inspection
+previews, unknown tools, malformed arguments, unsafe paths, `submit_patch` mixed with reads,
+duplicate submissions, `max_tokens` truncation rejected before tool calls run, invalid diffs
+corrected within budget, every budget being exhausted, context-budget termination, provider and
+token-counting failures, completion without a patch, concurrent claims permitting exactly one model
+caller, and a synthetic-sentinel credential never reaching the database or the API.
+
+### Live agent smoke test (optional — spends money and GitHub rate limit)
+
+```bash
+cd backend
+export ANTHROPIC_API_KEY=sk-ant-...
+export DATABASE_URL="sqlite:///$(mktemp -d)/live.db"
+uv run alembic upgrade head
+RID=$(uv run python -c "
+from app.database import SessionLocal
+from app import repository
+with SessionLocal() as db:
+    print(repository.create_run(db,
+        repository_url='https://github.com/pallets/itsdangerous',
+        issue_description='Signer.unsign() raises a confusing ValueError for an empty payload instead of BadSignature.',
+        max_parallel_attempts=1).id)")
+uv run python -m app.worker inspect --run-id "$RID"
+uv run python -m app.worker propose --run-id "$RID"
+unset DATABASE_URL
+```
+
 ### Live inspection (optional, uses your GitHub rate limit)
 
 ```bash
@@ -245,10 +309,14 @@ Base path `/api`. Interactive documentation is at `/docs` while the backend is r
 | `GET` | `/api/runs?limit=` | List runs, newest first. `limit` is 1–100, default 25. |
 | `GET` | `/api/runs/{run_id}` | Fetch one run **plus its inspection**. `404` if unknown. |
 
-`GET /api/runs/{run_id}` returns the run with a nested `inspection` object, which is `null` until
-the worker has run. The list endpoint deliberately omits inspections — including them would make a
-list response unbounded. The detail response stays bounded because the worker's budgets bound the
-report when it is written.
+`GET /api/runs/{run_id}` returns the run with nested `inspection` and `patch_attempt` objects, each
+`null` until the corresponding worker command has run. The list endpoint deliberately omits both —
+including them would make a list response unbounded. The detail response stays bounded because the
+workers' budgets bound what they write, and the attempt's event list is capped as well
+(`events_total` reports how many exist).
+
+A run's own `status` reflects **inspection only**: it stays `ready` whether a patch attempt succeeds
+or fails. Attempt state lives on `patch_attempt.status` (`running`, `succeeded`, `failed`).
 
 ### Creating a run
 
@@ -322,8 +390,77 @@ So an inspection uses between 3 and 11 requests at the default settings — **ro
 per hour**. Treat that as approximate: the allowance is per IP, so anything else on your network
 using the GitHub API shares it, and inspections that fetch fewer files cost less.
 
+`propose` draws from the **same** allowance: one request per uncached `read_file`, capped by
+`AGENT_MAX_TOOL_CALLS`. Files already read during inspection are seeded into the agent's cache and
+cost nothing, and a repeated read within one attempt is served from cache. Even so, an attempt that
+reads a lot can exhaust what an inspection left — the live example above used 5 requests to inspect
+and 11 more to propose, 16 of the hour's 60.
+
 When the limit is exhausted the worker fails the run with a `rate_limited` error naming the reset
 time. It does **not** retry — rerunning immediately would just burn the next window.
+
+## Model configuration and budgets
+
+`worker propose` needs an Anthropic API key and a model identifier:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...        # from https://console.anthropic.com/
+export ANTHROPIC_MODEL=claude-opus-5       # or any model your account can use
+```
+
+Either export them or put them in `backend/.env` (gitignored). **Never commit a real key.** If the
+key is missing or the model is unset, `propose` fails with exit code `5` **before** creating an
+attempt row, so a misconfiguration never leaves a half-claimed attempt behind.
+
+The key is held as a `SecretStr`, so it does not appear in a settings `repr`. It is never logged,
+never written to a database row or event, and never included in an API response.
+
+### Budgets
+
+Every limit is configurable (see `backend/.env.example`). Each has its own failure kind, recorded on
+the attempt:
+
+| Setting | Default | Bounds |
+|---|---|---|
+| `AGENT_MAX_TURNS` | 8 | Model round-trips per attempt |
+| `AGENT_MAX_TOOL_CALLS` | 12 | Tool calls per attempt |
+| `AGENT_MAX_FILE_BYTES` | 60,000 | One `read_file` |
+| `AGENT_MAX_TOTAL_FETCHED_BYTES` | 200,000 | All reads combined |
+| `AGENT_MAX_OUTPUT_TOKENS` | 16,000 | Output per model call |
+| `AGENT_MODEL_CONTEXT_TOKENS` | 1,000,000 | The model's context window |
+| `AGENT_CONTEXT_SAFETY_MARGIN_TOKENS` | 8,000 | Held back from that window |
+| `AGENT_MAX_PATCH_BYTES` | 60,000 | Submitted diff |
+| `AGENT_MAX_EVENTS` | 200 | Stored events per attempt |
+
+**Context is measured, not estimated.** Before every generation the worker calls the provider's
+token-counting endpoint with the system prompt, the tool definitions, and the full message history.
+The usable input budget is the context window minus the output reservation minus the safety margin —
+976,000 tokens at the defaults. If a request would exceed it the attempt **stops with an
+explanation**; conversation history is never silently discarded, because context compaction is not
+implemented yet.
+
+**Retries are disabled.** The SDK is configured with `max_retries=0`, so a failed call is never
+transparently repeated at the cost of the attempt's budget. Note that
+`AGENT_REQUEST_TIMEOUT_SECONDS` applies to **one HTTP request**, not to the attempt as a whole — the
+turn and tool-call limits are what bound total work. A long attempt can therefore run for several
+minutes; the live example above took about 110 seconds.
+
+### What the agent can and cannot do
+
+The agent gets exactly two tools, and the Python controller validates and dispatches every call:
+
+| Tool | Arguments | Notes |
+|---|---|---|
+| `read_file` | `path` | Reads from the **inspected commit**, which the model cannot change |
+| `submit_patch` | `diff`, `summary`, `suggested_test_command` | Must be the only call in its response |
+
+It cannot choose a URL, run a command, read local files, or move to a different commit. Unknown
+tools, malformed arguments, unsafe paths, and invalid diffs come back as bounded tool errors so the
+model can correct itself within its remaining budgets. A response truncated at `max_tokens` is
+rejected **before** its tool calls run, since the arguments may be incomplete.
+
+Repository content — READMEs included — is given to the model as data, with an explicit instruction
+that any directions found inside it must be ignored.
 
 ## Configuration
 
@@ -349,6 +486,9 @@ edit them; neither contains secrets.
 | `GITHUB_MAX_TOTAL_CONTENT_BYTES` | `400000` | Cap across all previews combined |
 | `GITHUB_MAX_FILES_LISTED` | `500` | File-listing size in the report (display only) |
 | `GITHUB_MAX_FILES_FETCHED` | `8` | How many files to preview |
+| `ANTHROPIC_API_KEY` | *(unset)* | Required by `worker propose`. Never commit a real key |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | A model your account can access |
+| `AGENT_*` | see above | Agent budgets — [Model configuration and budgets](#model-configuration-and-budgets) |
 
 The dashboard requests 25 runs per list call, so keep `RUN_LIST_MAX_LIMIT` at 25 or above —
 lowering it below that makes every list request fail validation with a 422.
@@ -373,20 +513,25 @@ backend/
     schemas.py       Request/response schemas; UTC timestamp serialization
     validators.py    GitHub repository URL validation and normalization
     repository.py    All database queries — no FastAPI imports
-    worker.py        Inspection worker CLI; owns the transaction boundaries
+    worker.py        Worker CLI (inspect, propose); owns transaction boundaries
     github_client.py Bounded read-only GitHub client; typed errors
     inspection.py    File selection, pytest heuristic, report building
+    model_client.py  The model boundary: ModelTurn, protocol, Anthropic adapter
+    agent.py         Controller loop, tool dispatch, budgets, prompt building
+    patch_validation.py  Unified-diff syntax, hunk counts, path safety
     routers/
       health.py      GET /api/health
       runs.py        Run endpoints; thin handlers delegating to repository
     time_utils.py    UTC helpers
   alembic/
     env.py           Resolves the URL from DATABASE_URL
-    versions/        0001_create_runs_table.py, 0002_create_inspections_table.py
+    versions/        0001_create_runs_table.py, 0002_create_inspections_table.py,
+                     0003_create_patch_attempts.py
   tests/
     conftest.py      Temporary migrated database, dependency override, TestClient
     test_validators.py, test_runs_api.py, test_migrations.py,
-    test_worker.py (mocked GitHub), test_claim.py (claim contention)
+    test_worker.py (mocked GitHub), test_claim.py (claim contention),
+    test_agent.py (scripted model), test_attempt_claim.py (contention + leakage)
 
 frontend/src/
   App.tsx            Page composition and all data fetching
@@ -394,7 +539,7 @@ frontend/src/
   types.ts           Types mirroring the backend schemas
   time.ts            Absolute and relative timestamp formatting
   components/        NewRunForm, RunList, RunDetail, InspectionPanel,
-                     StatusBadge, Callout, NotImplementedNote
+                     PatchAttemptPanel, StatusBadge, Callout, NotImplementedNote
   styles.css         Theme and layout (light and dark)
 ```
 
@@ -437,16 +582,43 @@ Choices made now so a worker process can be added next without rework:
 - **File selection runs over the whole tree**, before the display-only listing limit, so a README
   that sorts late alphabetically is still chosen. Root-level files win over nested ones.
 - **`httpx2` is httpx v2.** It installs under the module name `httpx2`, which is why imports read
-  `import httpx2`. Do not add the older `httpx` package alongside it — one HTTP stack is enough, and
-  Starlette's `TestClient` wants `httpx2` too.
+  `import httpx2`. Do not add the older `httpx` package alongside it — one HTTP stack is enough.
+  Starlette's `TestClient` wants `httpx2`, and so does `anthropic` 1.x, so all three share it.
+- **The model sits behind a narrow interface** (`app/model_client.py`): one `ModelTurn` dataclass and
+  a `ModelClient` protocol with `create_message` and `count_input_tokens`. Tests inject a scripted
+  client, so the controller loop is fully testable offline. This is deliberately *not* a
+  multi-provider framework — there is one adapter.
+- **The controller loop is hand-written, not the SDK's tool runner**, because this milestone requires
+  the Python side to validate and dispatch every tool call, enforce budgets, and cache reads.
+- **An attempt is claimed by inserting its row.** `patch_attempts.run_id` is `UNIQUE`, so the INSERT
+  *is* the atomic claim: the loser of a race catches `IntegrityError` and exits having made zero
+  model calls and zero GitHub requests. One mechanism satisfies both "atomic claim" and "one attempt
+  per run, enforced in the database".
+- **Attempt status is separate from run status.** A run stays `ready` — meaning inspection
+  succeeded — through a successful *and* a failed attempt. None of the attempt persistence functions
+  touch `Run.status`.
+- **Events are committed as they happen**, each in its own short transaction, so the dashboard's
+  Refresh shows progress while an attempt is still running. The final patch and the `succeeded`
+  status are written together in a single transaction instead.
+- **Patch submissions are validated at runtime even though the tool schema is `strict: true`.** A
+  schema guarantees argument shape, never that a diff is well formed or its paths safe;
+  `app/patch_validation.py` checks hunk line counts, rejects absolute and `..` paths, and refuses
+  binary patches, renames, and copies. Passing validation does **not** mean the patch applies or
+  works — nothing runs `git apply`.
 
 ## Limitations
 
 Everything below is deliberately out of scope for milestone 1.
 
-- **No fixes and no test execution.** `ready` means the inspection finished. Nothing generates a
-  patch, calls a model, installs dependencies, or runs a test suite, and no such activity is
-  simulated.
+- **A proposed patch is unverified.** It is checked for unified-diff syntax and path safety only.
+  Nothing applies it, compiles it, installs dependencies, or runs a test suite — so it may not apply
+  cleanly and may not fix the issue. The suggested test command is text for a human to run.
+- **One attempt per run, and no retries.** A failed attempt cannot be re-run; create a new run.
+  Abrupt interruption can leave an attempt `running` forever, since recovery is not implemented.
+- **One agent, not competing attempts.** `max_parallel_attempts` is still stored and unused; parallel
+  agents and result comparison come later.
+- **No context compaction.** If the conversation would exceed the input budget the attempt stops with
+  an explanation rather than dropping history.
 - **The repository is never cloned and its code is never executed.** Everything is read through the
   GitHub API. Repository content is treated strictly as untrusted data: it is stored as text and
   displayed as plain text, never evaluated, imported, or followed as instructions.

@@ -107,9 +107,44 @@ export interface Inspection {
   error_message: string | null;
 }
 
-/** The run detail endpoint returns the run plus its inspection. */
+/** Patch-attempt state, independent of the run's own status. */
+export type AttemptStatus = "running" | "succeeded" | "failed";
+
+export interface AttemptEvent {
+  seq: number;
+  kind: string;
+  summary: string;
+  detail: string | null;
+  created_at: string;
+}
+
+/**
+ * One agent attempt. `diff` is an UNVERIFIED proposal — it was never applied and
+ * no tests were run.
+ */
+export interface PatchAttempt {
+  id: string;
+  run_id: string;
+  status: AttemptStatus;
+  model: string;
+  commit_sha: string | null;
+  diff: string | null;
+  summary: string | null;
+  suggested_test_command: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  error_kind: string | null;
+  error_message: string | null;
+  started_at: string;
+  completed_at: string | null;
+  events: AttemptEvent[];
+  events_total: number;
+}
+
+/** The run detail endpoint returns the run plus its inspection and attempt. */
 export interface RunDetail extends Run {
   inspection: Inspection | null;
+  patch_attempt: PatchAttempt | null;
 }
 
 export const MAX_ISSUE_DESCRIPTION_LENGTH = 10_000;
@@ -118,4 +153,8 @@ export const ATTEMPT_CHOICES = [1, 2, 3] as const;
 /** Shown so the user can copy the exact command for a run. */
 export function workerCommand(runId: string): string {
   return `uv run python -m app.worker inspect --run-id ${runId}`;
+}
+
+export function proposeCommand(runId: string): string {
+  return `uv run python -m app.worker propose --run-id ${runId}`;
 }

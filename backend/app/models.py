@@ -26,6 +26,12 @@ RUN_STATUS_INSPECTING = "inspecting"
 RUN_STATUS_READY = "ready"
 RUN_STATUS_FAILED = "failed"
 
+# Patch-attempt lifecycle. Deliberately SEPARATE from the run status: a run stays
+# `ready` (meaning inspection succeeded) whether an attempt succeeds or fails.
+ATTEMPT_STATUS_RUNNING = "running"
+ATTEMPT_STATUS_SUCCEEDED = "succeeded"
+ATTEMPT_STATUS_FAILED = "failed"
+
 MIN_PARALLEL_ATTEMPTS = 1
 MAX_PARALLEL_ATTEMPTS = 3
 
@@ -68,6 +74,9 @@ class Run(Base):
     )
 
     inspection: Mapped["Inspection | None"] = relationship(
+        back_populates="run", uselist=False, cascade="all, delete-orphan"
+    )
+    patch_attempt: Mapped["PatchAttempt | None"] = relationship(
         back_populates="run", uselist=False, cascade="all, delete-orphan"
     )
 
@@ -121,3 +130,95 @@ class Inspection(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Inspection run_id={self.run_id!r} sha={self.commit_sha!r}>"
+
+
+class PatchAttempt(Base):
+    """One bounded agent attempt to propose a patch for a run.
+
+    `run_id` is UNIQUE, which is what makes creating the row an atomic claim:
+    two workers racing to start an attempt cannot both insert, so only one ever
+    calls the model. One attempt per inspected run in this milestone.
+
+    The stored diff is a *proposal*. It is never applied and never tested.
+    """
+
+    __tablename__ = "patch_attempts"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ATTEMPT_STATUS_RUNNING,
+        server_default=ATTEMPT_STATUS_RUNNING,
+    )
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    commit_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    diff: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_test_command: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Reported by the provider. Left NULL when unavailable — never fabricated.
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    run: Mapped["Run"] = relationship(back_populates="patch_attempt")
+    events: Mapped[list["AttemptEvent"]] = relationship(
+        back_populates="attempt",
+        cascade="all, delete-orphan",
+        order_by="AttemptEvent.seq",
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<PatchAttempt run_id={self.run_id!r} status={self.status!r}>"
+
+
+class AttemptEvent(Base):
+    """One ordered operational event during an attempt.
+
+    Records what the controller did — a file was requested, a tool errored, a
+    patch was submitted — never the model's hidden reasoning. `detail` is
+    truncated at write time so a row cannot grow without bound.
+    """
+
+    __tablename__ = "attempt_events"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    attempt_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("patch_attempts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    attempt: Mapped["PatchAttempt"] = relationship(back_populates="events")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<AttemptEvent seq={self.seq} kind={self.kind!r}>"
