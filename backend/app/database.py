@@ -4,9 +4,12 @@ The schema itself is owned by Alembic — nothing here calls create_all, so a
 migration failure cannot be masked by the app building its own tables at startup.
 """
 
+import sqlite3
 from collections.abc import Iterator
+from typing import Any
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
@@ -14,6 +17,21 @@ from app.config import settings
 
 class Base(DeclarativeBase):
     pass
+
+
+@event.listens_for(Engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection: Any, connection_record: Any) -> None:
+    """Turn on foreign-key enforcement for every SQLite connection.
+
+    SQLite ignores foreign keys unless this pragma is set per connection. The
+    listener is registered on the Engine class rather than one engine instance so
+    that the API, the worker, and the test engines all get it — anything that
+    opens a SQLite connection in this process is covered.
+    """
+    if isinstance(dbapi_connection, sqlite3.Connection):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 def _engine_kwargs(database_url: str) -> dict[str, object]:

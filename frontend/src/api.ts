@@ -6,7 +6,7 @@
  * `{loc, msg}` objects, while other errors carry `detail` as a plain string.
  */
 
-import type { Run, RunCreateInput } from "./types";
+import type { Run, RunCreateInput, RunDetail } from "./types";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000").replace(
   /\/+$/,
@@ -125,8 +125,8 @@ export function fetchRuns(limit = 25): Promise<Run[]> {
   return request<Run[]>(`/api/runs?limit=${limit}`);
 }
 
-export function fetchRun(runId: string): Promise<Run> {
-  return request<Run>(`/api/runs/${encodeURIComponent(runId)}`);
+export function fetchRun(runId: string): Promise<RunDetail> {
+  return request<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
 }
 
 export function createRun(input: RunCreateInput): Promise<Run> {

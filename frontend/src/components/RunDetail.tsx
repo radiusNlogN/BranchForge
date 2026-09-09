@@ -1,19 +1,29 @@
-import type { Run } from "../types";
+import type { RunDetail as RunDetailData } from "../types";
 import { formatAbsolute, formatRelative } from "../time";
 import { Callout } from "./Callout";
+import { InspectionPanel } from "./InspectionPanel";
 import { NotImplementedNote } from "./NotImplementedNote";
 import { StatusBadge } from "./StatusBadge";
 
 interface RunDetailProps {
-  run: Run | null;
+  run: RunDetailData | null;
   loading: boolean;
   error: string | null;
   /** True when this run was created by the current session, for a confirmation line. */
   justCreated: boolean;
   onRetry: () => void;
+  /** Re-fetch this run so a finished worker's report appears. */
+  onRefresh: () => void;
 }
 
-export function RunDetail({ run, loading, error, justCreated, onRetry }: RunDetailProps) {
+export function RunDetail({
+  run,
+  loading,
+  error,
+  justCreated,
+  onRetry,
+  onRefresh,
+}: RunDetailProps) {
   return (
     <section className="card card--detail">
       <div className="card__header">
@@ -99,6 +109,14 @@ export function RunDetail({ run, loading, error, justCreated, onRetry }: RunDeta
             <h3>Issue description</h3>
             <p>{run.issue_description}</p>
           </div>
+
+          <InspectionPanel
+            runId={run.id}
+            status={run.status}
+            inspection={run.inspection}
+            refreshing={loading}
+            onRefresh={onRefresh}
+          />
         </div>
       ) : null}
     </section>

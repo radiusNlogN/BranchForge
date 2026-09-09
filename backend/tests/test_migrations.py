@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 from alembic import command
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import IntegrityError
 
 from app.database import Base
-from app.models import Run
+from app.models import Inspection, Run
 from sqlalchemy.orm import sessionmaker
 from tests.conftest import alembic_config
 
@@ -22,6 +23,66 @@ def migration_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     url = f"sqlite:///{tmp_path / 'migration_check.db'}"
     monkeypatch.setenv("DATABASE_URL", url)
     return url
+
+
+def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> None:
+    """Every migrated table matches its model, column for column."""
+    command.upgrade(alembic_config(migration_db), "head")
+
+    engine = create_engine(migration_db)
+    try:
+        inspector = inspect(engine)
+        assert {"runs", "inspections"} <= set(inspector.get_table_names())
+
+        for table in ("runs", "inspections"):
+            migrated = {column["name"] for column in inspector.get_columns(table)}
+            expected = {column.name for column in Base.metadata.tables[table].columns}
+            assert migrated == expected, f"{table}: {migrated ^ expected}"
+
+        foreign_keys = inspector.get_foreign_keys("inspections")
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0]["referred_table"] == "runs"
+        assert foreign_keys[0]["constrained_columns"] == ["run_id"]
+        assert foreign_keys[0]["options"]["ondelete"] == "CASCADE"
+
+        index_names = {index["name"] for index in inspector.get_indexes("inspections")}
+        assert "ix_inspections_run_id" in index_names
+    finally:
+        engine.dispose()
+
+
+def test_foreign_keys_are_enforced(migration_db: str) -> None:
+    """An inspection cannot reference a run that does not exist.
+
+    SQLite only honours foreign keys when PRAGMA foreign_keys=ON, which
+    app.database sets for every connection.
+    """
+    command.upgrade(alembic_config(migration_db), "head")
+
+    engine = create_engine(migration_db)
+    try:
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+
+        with sessionmaker(bind=engine)() as session:
+            session.add(Inspection(run_id="00000000-0000-0000-0000-000000000000"))
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
+        # A valid reference still inserts, and cascades on delete.
+        with sessionmaker(bind=engine)() as session:
+            run = Run(repository_url="https://github.com/o/r", issue_description="x")
+            session.add(run)
+            session.commit()
+            session.add(Inspection(run_id=run.id, commit_sha="a" * 40))
+            session.commit()
+
+            session.delete(run)
+            session.commit()
+            assert session.query(Inspection).count() == 0
+    finally:
+        engine.dispose()
 
 
 def test_upgrade_creates_schema_matching_the_models(migration_db: str) -> None:

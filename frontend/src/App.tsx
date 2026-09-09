@@ -7,7 +7,7 @@ import { NewRunForm } from "./components/NewRunForm";
 import { NotImplementedNote } from "./components/NotImplementedNote";
 import { RunDetail } from "./components/RunDetail";
 import { RunList } from "./components/RunList";
-import type { Run, RunCreateInput } from "./types";
+import type { Run, RunCreateInput, RunDetail as RunDetailData } from "./types";
 
 const LIST_LIMIT = 25;
 
@@ -22,7 +22,7 @@ export default function App() {
   const [listError, setListError] = useState<string | null>(null);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selectedRun, setSelectedRun] = useState<Run | null>(null);
+  const [selectedRun, setSelectedRun] = useState<RunDetailData | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
 
@@ -166,6 +166,11 @@ export default function App() {
               justCreated={selectedRun !== null && selectedRun.id === createdId}
               onRetry={() => {
                 if (selectedId !== null) void loadDetail(selectedId);
+              }}
+              onRefresh={() => {
+                // Refresh both panes: a finished worker changes the list status too.
+                if (selectedId !== null) void loadDetail(selectedId);
+                void loadRuns();
               }}
             />
           </div>

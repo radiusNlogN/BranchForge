@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app import repository
 from app.config import settings
 from app.database import get_db
-from app.schemas import RunCreate, RunRead
+from app.schemas import InspectionRead, RunCreate, RunDetailRead, RunRead
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -49,16 +49,25 @@ def list_runs(
     return [RunRead.model_validate(run) for run in runs]
 
 
-@router.get("/{run_id}", response_model=RunRead)
+@router.get("/{run_id}", response_model=RunDetailRead)
 def get_run(
     run_id: str = Path(description="Server-generated run UUID."),
     db: Session = Depends(get_db),
-) -> RunRead:
-    """Return one run, or 404 if no run has this id."""
+) -> RunDetailRead:
+    """Return one run together with its inspection, or 404 if unknown.
+
+    The inspection is `null` until the worker has run. The response stays bounded
+    because the worker's budgets bound the report when it is written.
+    """
     run = repository.get_run(db, run_id)
     if run is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No run found with id {run_id!r}.",
         )
-    return RunRead.model_validate(run)
+
+    inspection = repository.get_inspection_for_run(db, run_id)
+    detail = RunDetailRead.model_validate(run)
+    if inspection is not None:
+        detail.inspection = InspectionRead.model_validate(inspection)
+    return detail

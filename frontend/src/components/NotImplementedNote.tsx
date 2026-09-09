@@ -1,13 +1,16 @@
 /**
- * The honest disclaimer. This milestone stores runs and nothing else, so it is
- * stated wherever a run's status is shown rather than buried in a footer.
+ * The honest scope statement.
+ *
+ * Milestone 2 added real GitHub inspection, so the earlier claim that BranchForge
+ * "does not contact GitHub" is no longer true. Keep this text matching what the
+ * code actually does — stale honesty text is worse than none.
  */
 export function NotImplementedNote({ compact = false }: { compact?: boolean }) {
   if (compact) {
     return (
       <p className="note note--compact">
-        Saved to the database. Execution is not implemented yet, so this run will stay{" "}
-        <code>pending</code>.
+        Inspection is read-only. No fix has been attempted — AI fixes and test execution are not
+        implemented yet.
       </p>
     );
   }
@@ -15,14 +18,19 @@ export function NotImplementedNote({ compact = false }: { compact?: boolean }) {
   return (
     <div className="note">
       <p>
-        <strong>Milestone 1: intake and persistence only.</strong> Submitting a run validates it and
-        writes it to the database, where it stays in the <code>pending</code> state.
+        <strong>Milestone 2: repository inspection.</strong> Creating a run stores it as{" "}
+        <code>pending</code>. A separate worker command then reads the repository through the GitHub
+        API and saves an inspection report, moving the run to <code>ready</code> or{" "}
+        <code>failed</code>.
       </p>
       <p>
-        Nothing is executed. BranchForge does not yet clone the repository, contact GitHub, call a
-        model, or run any fix attempts, and no progress or results are simulated. Repository URLs are
-        checked for shape only — that a URL is accepted does not mean the repository exists or is
-        public.
+        <strong>&ldquo;Ready&rdquo; means the inspection finished, not that a fix exists.</strong>{" "}
+        BranchForge does not yet call any AI model, generate patches, or run tests, and nothing is
+        simulated. Inspection is strictly read-only: the repository is never cloned, its
+        dependencies are never installed, and its code is never executed.
+      </p>
+      <p>
+        Runs are not scheduled automatically — you run the worker yourself, then refresh.
       </p>
     </div>
   );

@@ -6,8 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
-from app import repository
-from tests.conftest import VALID_PAYLOAD
+from app import repository, worker
+from tests.conftest import INSPECTABLE_PAYLOAD, VALID_PAYLOAD
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -34,7 +34,12 @@ def test_create_then_retrieve_persisted_run(client: TestClient) -> None:
 
     fetched = client.get(f"/api/runs/{body['id']}")
     assert fetched.status_code == 200
-    assert fetched.json() == body
+    detail = fetched.json()
+
+    # The detail endpoint returns the same run plus its inspection, which is null
+    # until the worker has run.
+    assert detail["inspection"] is None
+    assert {key: detail[key] for key in body} == body
 
 
 def test_created_run_is_visible_in_a_separate_session(
@@ -217,3 +222,89 @@ def test_list_respects_limit(client: TestClient) -> None:
 @pytest.mark.parametrize("limit", [0, -1, 101, 1000])
 def test_list_rejects_out_of_bounds_limit(client: TestClient, limit: int) -> None:
     assert client.get("/api/runs", params={"limit": limit}).status_code == 422
+
+
+# --- Inspection exposed through run detail -----------------------------------
+
+
+def test_run_detail_has_null_inspection_before_the_worker_runs(client: TestClient) -> None:
+    run_id = client.post("/api/runs", json=VALID_PAYLOAD).json()["id"]
+    body = client.get(f"/api/runs/{run_id}").json()
+    assert body["status"] == "pending"
+    assert body["inspection"] is None
+
+
+def test_run_detail_returns_the_persisted_inspection(
+    client: TestClient, session_factory, fake_github, worker_settings
+) -> None:
+    run_id = client.post("/api/runs", json=INSPECTABLE_PAYLOAD).json()["id"]
+    assert (
+        worker.inspect_run(
+            run_id,
+            session_factory=session_factory,
+            client_factory=fake_github.client_factory,
+            config=worker_settings,
+        )
+        == worker.EXIT_OK
+    )
+
+    body = client.get(f"/api/runs/{run_id}").json()
+    assert body["status"] == "ready"
+
+    inspection = body["inspection"]
+    assert inspection is not None
+    assert inspection["run_id"] == run_id
+    assert inspection["commit_sha"] == fake_github.commit_sha
+    assert inspection["default_branch"] == "main"
+    assert inspection["error_kind"] is None
+    # Timestamps keep the milestone-1 UTC contract.
+    assert inspection["started_at"].endswith("Z")
+    assert inspection["completed_at"].endswith("Z")
+
+    report = inspection["report"]
+    assert report["repository"]["commit_sha"] == fake_github.commit_sha
+    assert report["readme"]["path"] == "README.md"
+    assert report["assessment"]["uses_pytest"] is True
+    assert report["assessment"]["caveat"]
+    assert report["budgets"]["requests_made"] >= 3
+
+
+def test_failed_inspection_is_visible_with_its_error(
+    client: TestClient, session_factory, worker_settings
+) -> None:
+    import httpx2
+
+    from tests.conftest import FakeGitHub
+
+    run_id = client.post("/api/runs", json=INSPECTABLE_PAYLOAD).json()["id"]
+    fake = FakeGitHub(responses={"/repos/o/r": httpx2.Response(404, json={"message": "Not Found"})})
+    worker.inspect_run(
+        run_id,
+        session_factory=session_factory,
+        client_factory=fake.client_factory,
+        config=worker_settings,
+    )
+
+    body = client.get(f"/api/runs/{run_id}").json()
+    assert body["status"] == "failed"
+    assert body["inspection"]["error_kind"] == "repository_unavailable"
+    assert body["inspection"]["error_message"]
+    assert body["inspection"]["report"] is None
+
+
+def test_list_endpoint_does_not_include_inspections(
+    client: TestClient, session_factory, fake_github, worker_settings
+) -> None:
+    """Inspections would make the list response unbounded."""
+    run_id = client.post("/api/runs", json=INSPECTABLE_PAYLOAD).json()["id"]
+    worker.inspect_run(
+        run_id,
+        session_factory=session_factory,
+        client_factory=fake_github.client_factory,
+        config=worker_settings,
+    )
+
+    listed = client.get("/api/runs").json()
+    assert listed[0]["id"] == run_id
+    assert listed[0]["status"] == "ready"
+    assert "inspection" not in listed[0]

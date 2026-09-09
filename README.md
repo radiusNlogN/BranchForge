@@ -3,21 +3,28 @@
 BranchForge investigates GitHub issues by running competing agent-generated fixes in isolated
 environments and presenting verified patches.
 
-**This repository currently contains milestone 1 only: run intake and persistence.**
-A run is validated, given a server-side identity, and stored in the `pending` state. Nothing is
-executed. There is no cloning, no GitHub API access, no model calls, no workers, no containers, and
-no authentication — and no simulated progress or fabricated results standing in for them.
+**This repository currently contains milestones 1 and 2: run intake, and read-only repository
+inspection.** A run is validated and stored as `pending`. A separate worker command then reads the
+repository through the GitHub API and saves an inspection report, moving the run to `ready` or
+`failed`.
+
+**"Ready" means the inspection finished — not that a fix exists.** There are no model calls, no
+generated patches, and no test execution. Inspection is strictly read-only: the repository is never
+cloned, its dependencies are never installed, and its code is never executed. Nothing is scheduled
+automatically and no progress or results are simulated.
 
 ---
 
 ## Contents
 
 - [What works today](#what-works-today)
+- [The workflow](#the-workflow)
 - [Requirements](#requirements)
 - [Setup](#setup)
 - [Running locally](#running-locally)
 - [Verification](#verification)
 - [API](#api)
+- [GitHub rate limits](#github-rate-limits)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 - [Design notes](#design-notes)
@@ -30,9 +37,54 @@ no authentication — and no simulated progress or fabricated results standing i
 - Create a run from the dashboard or the API; the backend validates it and persists it to SQLite.
 - Repository URLs are checked to be HTTPS `github.com/<owner>/<repo>` addresses and normalized.
 - Runs are listed newest-first with a bounded limit, and can be fetched individually by UUID.
-- Data survives backend restarts; the schema is created and owned by an Alembic migration.
-- The dashboard shows the actual persisted record it reads back from the API, with loading, empty,
-  validation, and error states, and states plainly that runs are never executed.
+- Data survives backend restarts; the schema is created and owned by Alembic migrations.
+- A separate worker process claims a pending run atomically and inspects its repository through the
+  GitHub API — resolving the default branch to an immutable commit SHA, then reading the file tree,
+  README, and Python configuration from that one commit.
+- The report records the repository description, inspected commit, a bounded file listing, source
+  previews, likely test locations, and a Python/pytest assessment with the filenames supporting it.
+- Failures (missing repository, rate limiting, timeouts, oversized or malformed responses) are
+  stored as readable errors against the run.
+- The dashboard displays the persisted report with collapsible previews, truncation notices, and a
+  manual Refresh button.
+
+## The workflow
+
+Three steps. Nothing is automatic — you run the worker yourself.
+
+```bash
+# 1. Create a run (dashboard at http://localhost:5173, or the API directly)
+curl -X POST http://localhost:8000/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"repository_url":"https://github.com/pallets/itsdangerous",
+       "issue_description":"Check whether the signer handles empty payloads.",
+       "max_parallel_attempts":1}'
+# -> {"id":"64fbb850-...","status":"pending", ...}
+
+# 2. Inspect it with the worker, from backend/
+cd backend
+uv run python -m app.worker inspect --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
+
+# 3. Refresh the run's detail view in the dashboard (or GET /api/runs/<id>)
+```
+
+The worker prints what it did:
+
+```
+Claimed run 64fbb850-784e-44fa-8c73-9e0dce94c339 -> inspecting
+Inspecting https://github.com/pallets/itsdangerous (read-only; no clone, no code execution)
+Inspected itsdangerous at 672971d66a2e on main
+  50 files in tree, 50 listed, 2 previewed, 5 GitHub request(s)
+  Python project: True | uses pytest: True (heuristic)
+Run 64fbb850-784e-44fa-8c73-9e0dce94c339 -> ready (inspection complete; no fix attempted)
+```
+
+Exit codes: `0` inspected, `1` inspection failed (recorded against the run), `2` no such run,
+`3` the run was not claimable (already inspecting, finished, or taken by another worker).
+
+Only a `pending` run can be claimed, so a run is inspected at most once. The claim is a single
+conditional `UPDATE`, so two workers racing for the same run cannot both win — the loser exits
+without contacting GitHub.
 
 ## Requirements
 
@@ -118,6 +170,32 @@ npm run typecheck    # tsc --noEmit
 npm run build        # tsc --noEmit && vite build  (type errors fail the build)
 ```
 
+### Worker tests
+
+`tests/test_worker.py` and `tests/test_claim.py` mock GitHub at the **transport** layer
+(`httpx2.MockTransport`), so real URL construction, response-byte caps, and status handling all run
+— no network access. They cover a successful inspection, an unavailable repository, primary and
+secondary rate limiting, timeouts, malformed JSON, refused redirects, an invalid commit SHA, a
+truncated tree, an oversized response body, an oversized file omitted without being fetched, request
+budgets, and claim contention between two independent database connections.
+
+### Live inspection (optional, uses your GitHub rate limit)
+
+```bash
+cd backend
+export DATABASE_URL="sqlite:///$(mktemp -d)/live.db"
+uv run alembic upgrade head
+RID=$(uv run python -c "
+from app.database import SessionLocal
+from app import repository
+with SessionLocal() as db:
+    print(repository.create_run(db,
+        repository_url='https://github.com/pallets/itsdangerous',
+        issue_description='Live check.', max_parallel_attempts=1).id)")
+uv run python -m app.worker inspect --run-id "$RID"
+unset DATABASE_URL
+```
+
 ### Migration up and down, without touching your dev database
 
 Point `DATABASE_URL` at a throwaway file so your normal `branchforge.db` is never dropped:
@@ -165,7 +243,12 @@ Base path `/api`. Interactive documentation is at `/docs` while the backend is r
 | `GET` | `/api/health` | Liveness. Does not touch the database. |
 | `POST` | `/api/runs` | Create a run. `201` with the persisted record. |
 | `GET` | `/api/runs?limit=` | List runs, newest first. `limit` is 1–100, default 25. |
-| `GET` | `/api/runs/{run_id}` | Fetch one run. `404` if unknown. |
+| `GET` | `/api/runs/{run_id}` | Fetch one run **plus its inspection**. `404` if unknown. |
+
+`GET /api/runs/{run_id}` returns the run with a nested `inspection` object, which is `null` until
+the worker has run. The list endpoint deliberately omits inspections — including them would make a
+list response unbounded. The detail response stays bounded because the worker's budgets bound the
+report when it is written.
 
 ### Creating a run
 
@@ -221,6 +304,27 @@ Invalid request bodies and query parameters return **422** with FastAPI's field-
 an unknown run id returns **404** with a string `detail`. The frontend normalizes both shapes in
 `frontend/src/api.ts`.
 
+## GitHub rate limits
+
+The worker reads GitHub **without authentication**, which GitHub limits to roughly **60 requests per
+hour per IP address**.
+
+One inspection costs **3 + n requests**:
+
+| Request | Count |
+|---|---|
+| Repository metadata | 1 |
+| Commit resolution (default branch → commit SHA) | 1 |
+| Recursive file tree at that commit | 1 |
+| File contents | 1 per file fetched, up to `GITHUB_MAX_FILES_FETCHED` (default 8) |
+
+So an inspection uses between 3 and 11 requests at the default settings — **roughly 5 inspections
+per hour**. Treat that as approximate: the allowance is per IP, so anything else on your network
+using the GitHub API shares it, and inspections that fetch fewer files cost less.
+
+When the limit is exhausted the worker fails the run with a `rate_limited` error naming the reset
+time. It does **not** retry — rerunning immediately would just burn the next window.
+
 ## Configuration
 
 Nothing reads the environment directly except `backend/app/config.py`. Copy the example files and
@@ -234,6 +338,17 @@ edit them; neither contains secrets.
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated allowed browser origins |
 | `RUN_LIST_DEFAULT_LIMIT` | `25` | Default `GET /api/runs` page size |
 | `RUN_LIST_MAX_LIMIT` | `100` | Hard ceiling for `limit` |
+| `GITHUB_API_BASE_URL` | `https://api.github.com` | GitHub API root |
+| `GITHUB_USER_AGENT` | `BranchForge/0.2` | Sent with every request |
+| `GITHUB_REQUEST_TIMEOUT_SECONDS` | `10.0` | Per-request timeout |
+| `GITHUB_CONNECT_TIMEOUT_SECONDS` | `5.0` | Connection timeout |
+| `GITHUB_MAX_REQUESTS` | `20` | Hard ceiling on requests per inspection |
+| `GITHUB_MAX_RESPONSE_BYTES` | `8000000` | Raw response body cap (GitHub caps a tree at 7 MB) |
+| `GITHUB_MAX_CONTENT_RESPONSE_BYTES` | `262144` | Raw cap for file contents (base64 inflates by 4/3) |
+| `GITHUB_MAX_FILE_BYTES` | `100000` | Largest single file stored, decoded |
+| `GITHUB_MAX_TOTAL_CONTENT_BYTES` | `400000` | Cap across all previews combined |
+| `GITHUB_MAX_FILES_LISTED` | `500` | File-listing size in the report (display only) |
+| `GITHUB_MAX_FILES_FETCHED` | `8` | How many files to preview |
 
 The dashboard requests 25 runs per list call, so keep `RUN_LIST_MAX_LIMIT` at 25 or above —
 lowering it below that makes every list request fail validation with a 422.
@@ -258,24 +373,28 @@ backend/
     schemas.py       Request/response schemas; UTC timestamp serialization
     validators.py    GitHub repository URL validation and normalization
     repository.py    All database queries — no FastAPI imports
+    worker.py        Inspection worker CLI; owns the transaction boundaries
+    github_client.py Bounded read-only GitHub client; typed errors
+    inspection.py    File selection, pytest heuristic, report building
     routers/
       health.py      GET /api/health
       runs.py        Run endpoints; thin handlers delegating to repository
     time_utils.py    UTC helpers
   alembic/
     env.py           Resolves the URL from DATABASE_URL
-    versions/        0001_create_runs_table.py — owns the schema
+    versions/        0001_create_runs_table.py, 0002_create_inspections_table.py
   tests/
     conftest.py      Temporary migrated database, dependency override, TestClient
-    test_validators.py, test_runs_api.py, test_migrations.py
+    test_validators.py, test_runs_api.py, test_migrations.py,
+    test_worker.py (mocked GitHub), test_claim.py (claim contention)
 
 frontend/src/
   App.tsx            Page composition and all data fetching
   api.ts             Fetch wrapper; normalizes 422 and 404 error shapes
   types.ts           Types mirroring the backend schemas
   time.ts            Absolute and relative timestamp formatting
-  components/        NewRunForm, RunList, RunDetail, StatusBadge, Callout,
-                     NotImplementedNote
+  components/        NewRunForm, RunList, RunDetail, InspectionPanel,
+                     StatusBadge, Callout, NotImplementedNote
   styles.css         Theme and layout (light and dark)
 ```
 
@@ -297,16 +416,52 @@ Choices made now so a worker process can be added next without rework:
   value is the same *instant* after a round trip, not merely that the string ends in `Z`.
 - **Listing is ordered by `created_at DESC, id DESC`.** The `id` tiebreaker keeps ordering stable
   for runs created within the same clock tick.
+- **The worker holds no transaction across the network.** A short session claims the run and
+  commits; all GitHub work happens with no session open; a second short session stores the result.
+  On success the report and the `ready` status share **one commit**, so a run can never be `ready`
+  without its report. The same is true of a failure and its error.
+- **The claim is a conditional `UPDATE`** (`WHERE id = ? AND status = 'pending'`), so exactly one of
+  two racing workers can match a row. A test proves this: the same test against a naive
+  read-then-write claim produces two winners.
+- **The GitHub client never accepts a URL.** Its methods take `owner`, `repo`, `path`, and `ref`, and
+  build every request path from percent-encoded components, so a URL supplied by a repository or an
+  upstream response can never be fetched. The `url`, `git_url`, `download_url`, and `_links` fields
+  in GitHub responses are ignored, and redirects are refused rather than followed.
+- **Branch names are passed as a query parameter**, not a path segment, because a branch may contain
+  slashes (`release/v2`) that would otherwise change the shape of the request path.
+- **Response bodies are bounded before parsing.** File-size metadata is not a download limit, so
+  responses are rejected up front on a declared `Content-Length` over the cap and cut off mid-stream
+  otherwise — the cap applies before any JSON is parsed or base64 decoded.
+- **Oversized files cost nothing.** The tree lists each blob's size, so a file over the per-file
+  budget is reported as omitted without a content request ever being issued.
+- **File selection runs over the whole tree**, before the display-only listing limit, so a README
+  that sorts late alphabetically is still chosen. Root-level files win over nested ones.
+- **`httpx2` is httpx v2.** It installs under the module name `httpx2`, which is why imports read
+  `import httpx2`. Do not add the older `httpx` package alongside it — one HTTP stack is enough, and
+  Starlette's `TestClient` wants `httpx2` too.
 
 ## Limitations
 
 Everything below is deliberately out of scope for milestone 1.
 
-- **Runs never execute.** They are stored as `pending` and stay there. There is no worker, queue,
-  scheduler, or container runtime, and no code path advances a run's status.
-- **No GitHub contact of any kind.** URL validation is syntactic; the repository is never fetched,
-  so an accepted URL may point at something that does not exist or is private.
-- **No LLM or agent integration**, and no simulated activity standing in for it.
+- **No fixes and no test execution.** `ready` means the inspection finished. Nothing generates a
+  patch, calls a model, installs dependencies, or runs a test suite, and no such activity is
+  simulated.
+- **The repository is never cloned and its code is never executed.** Everything is read through the
+  GitHub API. Repository content is treated strictly as untrusted data: it is stored as text and
+  displayed as plain text, never evaluated, imported, or followed as instructions.
+- **Nothing is scheduled.** You run the worker yourself, per run, and refresh the page. There is no
+  queue, poller, or background scheduler.
+- **An interrupted worker leaves a run stuck in `inspecting`.** If the process is killed mid-
+  inspection, nothing resets the run and it cannot be claimed again. Durable recovery (a lease with
+  a timeout, or a reset command) is deliberately out of scope for this milestone.
+- **One inspection per run.** Only a `pending` run can be claimed, so a run cannot be re-inspected —
+  including after a failure. Create a new run instead.
+- **The Python/pytest assessment is a heuristic** based on filenames and configuration text. A
+  project may use pytest without declaring it, and missing configuration is not evidence that pytest
+  is unsupported. The report always ships the filenames behind its conclusions.
+- **Unauthenticated GitHub access only**, so roughly 5 inspections per hour and public repositories
+  only — see [GitHub rate limits](#github-rate-limits).
 - **No authentication or authorization.** Every caller sees every run. Do not expose this beyond
   localhost.
 - **SQLite and single-process only.** No connection pooling for concurrent writers, no Postgres
@@ -314,3 +469,5 @@ Everything below is deliberately out of scope for milestone 1.
 - **`status` has only one value** (`pending`). The enum will grow when execution exists.
 - **The run list is a single bounded page** — no pagination cursors, filtering, or search.
 - **No automated frontend tests.** The frontend is covered by type checking and a production build.
+- **No authentication on the API**, so anyone who can reach it can read every run. Keep it on
+  localhost.
