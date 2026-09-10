@@ -408,11 +408,18 @@ Changing any of these changes what BranchForge claims, so change them deliberate
    missing are recorded in `no_longer_exercised` and are *not* fixes.
 3. **A previously passing test that stops running** is a weakened yardstick ⇒ `inconclusive`, never a
    fix.
-4. **A missing, malformed, or oversized report is an error**, never an absence of failures.
+4. **A missing, malformed, oversized, or truncated report is an error**, never an absence of
+   failures. The first three fail in `runner.read_report`; the fourth reaches `compare_runs`, because
+   the plugin caps itself at `BF_REPORT_MAX_TESTS` and sets `truncated`. **That flag must stay wired
+   into the verdict** — it was persisted but unread once, which meant a suite over the cap could have
+   two partial reports compare equal and yield `fix_demonstrated`.
 
 And the asymmetry that matters most: **a patched-only collection or import failure is
 `patched_collection_error`, never an improvement** — the failing set went empty because nothing ran.
 This is verified live against a real repository, not only in mocks.
+
+The general shape of every rule above: an absence of evidence is never evidence of a fix. When adding
+a new code path here, ask what it does when the data is *missing* rather than merely bad.
 
 #### Four workspaces, and why `comparison` is not `patched_full`
 
@@ -422,8 +429,14 @@ This is verified live against a real repository, not only in mocks.
 `restore_original_test_environment` copies the original tests, every `conftest.py`, fixture data, and
 collection config back over the patched tree **and deletes test-environment files the patch added**.
 Both directions are needed: restoring alone would leave a patch-added `conftest.py` free to change
-collection. Supplemental runs of the patch's own tests use `patched_full` and persist to their own
-columns — a supplemental timeout must never overwrite the baseline-versus-patched verdict.
+collection.
+
+Supplemental runs of the patch's own tests use `patched_full` and persist to their own columns. Two
+properties to preserve: a supplemental failure or timeout must **never** overwrite or take down the
+baseline-versus-patched verdict (its errors are swallowed into `notes` on purpose), and it runs on
+**both** exit paths — including `tests_only_patch`, where the patch changed no source and its own
+tests are therefore the only evidence that exists. `run_supplemental()` is a closure called twice for
+exactly that reason; do not inline it back into one branch.
 
 #### Ordering rules
 
