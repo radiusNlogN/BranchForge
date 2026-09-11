@@ -971,6 +971,87 @@ textarea:disabled {
   border-color: color-mix(in srgb, var(--danger) 35%, transparent);
 }
 
+.badge--attempt-queued,
+.badge--orch-queued {
+  color: var(--pending);
+  border-color: color-mix(in srgb, var(--pending) 35%, transparent);
+}
+
+.badge--attempt-interrupted,
+.badge--verify-interrupted,
+.badge--orch-interrupted {
+  color: var(--muted);
+  border-color: color-mix(in srgb, var(--muted) 45%, transparent);
+}
+
+/* Orchestration badges say whether it ran to the end — never whether a patch
+   is good, so "completed" is deliberately not green. */
+.badge--orch-running {
+  color: var(--inspecting);
+  border-color: color-mix(in srgb, var(--inspecting) 35%, transparent);
+}
+
+.badge--orch-completed {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--text) 25%, transparent);
+}
+
+.badge--orch-failed {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+/* --- Competing attempts (milestone 5) ---------------------------------- */
+
+.tableWrap {
+  overflow-x: auto;
+  margin: 12px 0;
+}
+
+.attemptTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.attemptTable th,
+.attemptTable td {
+  text-align: left;
+  vertical-align: top;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.attemptTable th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.reasons summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.reasons ul {
+  margin: 4px 0 0;
+  padding-left: 16px;
+}
+
+.attemptDetails {
+  margin: 14px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+}
+
+.attemptDetails > summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .badge--attempt-running .badge__dot { animation: none; }
 }

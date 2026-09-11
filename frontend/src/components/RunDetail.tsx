@@ -1,10 +1,12 @@
-import type { RunDetail as RunDetailData } from "../types";
+import type { PatchAttempt, RunDetail as RunDetailData } from "../types";
+import { orchestrateCommand, proposeCommand, verifyAttemptCommand, verifyCommand } from "../types";
 import { formatAbsolute, formatRelative } from "../time";
 import { Callout } from "./Callout";
 import { InspectionPanel } from "./InspectionPanel";
 import { NotImplementedNote } from "./NotImplementedNote";
+import { OrchestrationPanel } from "./OrchestrationPanel";
 import { PatchAttemptPanel } from "./PatchAttemptPanel";
-import { VerificationPanel } from "./VerificationPanel";
+import { OUTCOME_LABELS, VerificationPanel } from "./VerificationPanel";
 import { StatusBadge } from "./StatusBadge";
 
 interface RunDetailProps {
@@ -16,6 +18,85 @@ interface RunDetailProps {
   onRetry: () => void;
   /** Re-fetch this run so a finished worker's report appears. */
   onRefresh: () => void;
+}
+
+function NoAttemptsYet({ run }: { run: RunDetailData }) {
+  if (run.status !== "ready") {
+    return (
+      <div className="empty">
+        <p className="empty__title">Inspect the repository first</p>
+        <p className="empty__text">
+          Patches can only be proposed for a run whose inspection has finished.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="empty">
+      <p className="empty__title">No patch attempts yet</p>
+      <p className="empty__text">
+        Nothing runs automatically. Run {run.max_parallel_attempts} competing attempt
+        {run.max_parallel_attempts === 1 ? "" : "s"}, each tested in a container and then compared:
+      </p>
+      <pre className="command">{orchestrateCommand(run.id)}</pre>
+      <p className="empty__text">Or propose a single patch manually:</p>
+      <pre className="command">{proposeCommand(run.id)}</pre>
+      <p className="muted small">
+        Run these from the <code>backend/</code> directory. They need <code>ANTHROPIC_API_KEY</code>;
+        <code> orchestrate</code> also needs Docker and the runner image. Then press Refresh.
+      </p>
+    </div>
+  );
+}
+
+function AttemptViews({
+  run,
+  attempt,
+  loading,
+  onRefresh,
+}: {
+  run: RunDetailData;
+  attempt: PatchAttempt;
+  loading: boolean;
+  onRefresh: () => void;
+}) {
+  const orchestrationActive =
+    run.orchestration !== null &&
+    (run.orchestration.status === "queued" || run.orchestration.status === "running");
+  const command =
+    run.attempts.length === 1 && attempt.orchestration_id === null
+      ? verifyCommand(run.id)
+      : verifyAttemptCommand(attempt.id);
+  return (
+    <>
+      <PatchAttemptPanel
+        attempt={attempt}
+        refreshing={loading}
+        onRefresh={onRefresh}
+        heading={run.attempts.length > 1 ? `Proposed patch — attempt ${attempt.attempt_index}` : "Proposed patch"}
+      />
+      <VerificationPanel
+        command={command}
+        hasAttempt={attempt.diff !== null}
+        pendingByOrchestrator={orchestrationActive && attempt.pipeline_error_kind === null}
+        verification={attempt.verification}
+        refreshing={loading}
+        onRefresh={onRefresh}
+      />
+    </>
+  );
+}
+
+function attemptSummaryLine(attempt: PatchAttempt): string {
+  const verification = attempt.verification;
+  const evidence = verification?.outcome
+    ? OUTCOME_LABELS[verification.outcome] ?? verification.outcome
+    : verification
+      ? `verification ${verification.status}`
+      : attempt.pipeline_error_kind
+        ? "verification never started"
+        : "no verification";
+  return `proposal ${attempt.status} · ${evidence}`;
 }
 
 export function RunDetail({
@@ -120,21 +201,47 @@ export function RunDetail({
             onRefresh={onRefresh}
           />
 
-          <PatchAttemptPanel
-            runId={run.id}
-            runStatus={run.status}
-            attempt={run.patch_attempt}
-            refreshing={loading}
-            onRefresh={onRefresh}
-          />
+          {run.orchestration !== null ? (
+            <OrchestrationPanel
+              orchestration={run.orchestration}
+              attempts={run.attempts}
+              refreshing={loading}
+              onRefresh={onRefresh}
+            />
+          ) : null}
 
-          <VerificationPanel
-            runId={run.id}
-            hasAttempt={run.patch_attempt !== null && run.patch_attempt.diff !== null}
-            verification={run.verification}
-            refreshing={loading}
-            onRefresh={onRefresh}
-          />
+          {run.attempts.length === 0 ? <NoAttemptsYet run={run} /> : null}
+
+          {/* A manual run keeps its milestone-4 layout: one attempt, shown inline. */}
+          {run.attempts.length === 1 && run.orchestration === null && run.attempts[0] ? (
+            <AttemptViews
+              run={run}
+              attempt={run.attempts[0]}
+              loading={loading}
+              onRefresh={onRefresh}
+            />
+          ) : null}
+
+          {run.orchestration !== null || run.attempts.length > 1
+            ? run.attempts.map((attempt) => (
+                <details
+                  key={attempt.id}
+                  className="attemptDetails"
+                  open={run.orchestration?.recommended_attempt_index === attempt.attempt_index}
+                >
+                  <summary>
+                    <strong>Attempt {attempt.attempt_index}</strong>{" "}
+                    <span className="muted small">{attemptSummaryLine(attempt)}</span>
+                  </summary>
+                  <AttemptViews
+                    run={run}
+                    attempt={attempt}
+                    loading={loading}
+                    onRefresh={onRefresh}
+                  />
+                </details>
+              ))
+            : null}
         </div>
       ) : null}
     </section>

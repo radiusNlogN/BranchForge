@@ -1,5 +1,4 @@
 import type { ComparisonData, RunSummaryData, Verification } from "../types";
-import { verifyCommand } from "../types";
 import { formatAbsolute } from "../time";
 
 /**
@@ -15,8 +14,11 @@ import { formatAbsolute } from "../time";
  * `<pre>`, with no `dangerouslySetInnerHTML` and no highlighting library.
  */
 
-/** Wording for each outcome. Neutral phrasing; nothing here says "verified". */
-const OUTCOME_LABELS: Record<string, string> = {
+/**
+ * Wording for each outcome. Neutral phrasing; nothing here says "verified".
+ * Exported so the orchestration summary uses the same words.
+ */
+export const OUTCOME_LABELS: Record<string, string> = {
   fix_demonstrated: "Originally failing tests now pass",
   partial_fix: "Some originally failing tests now pass",
   still_failing: "Originally failing tests still fail",
@@ -164,16 +166,20 @@ function ComparisonDetail({ comparison }: { comparison: ComparisonData }) {
 }
 
 interface Props {
-  runId: string;
+  /** The exact command that verifies THIS attempt. */
+  command: string;
   hasAttempt: boolean;
+  /** An active orchestrator will verify this patch itself. */
+  pendingByOrchestrator: boolean;
   verification: Verification | null;
   refreshing: boolean;
   onRefresh: () => void;
 }
 
 export function VerificationPanel({
-  runId,
+  command,
   hasAttempt,
+  pendingByOrchestrator,
   verification,
   refreshing,
   onRefresh,
@@ -186,14 +192,23 @@ export function VerificationPanel({
     return (
       <section className="panel">
         <h3>Verification</h3>
-        <p className="muted">
-          The proposed patch has not been applied or tested. To run the repository's own
-          test suite before and after the patch, in a container with no network:
-        </p>
-        <pre className="command">{verifyCommand(runId)}</pre>
-        <p className="muted small">
-          Requires Docker and the runner image. Refresh once it finishes.
-        </p>
+        {pendingByOrchestrator ? (
+          <p className="muted">
+            The orchestrator verifies this patch as the next step of its pipeline. Nothing polls
+            automatically — press Refresh.
+          </p>
+        ) : (
+          <>
+            <p className="muted">
+              The proposed patch has not been applied or tested. To run the repository's own
+              test suite before and after the patch, in a container with no network:
+            </p>
+            <pre className="command">{command}</pre>
+            <p className="muted small">
+              Requires Docker and the runner image. Refresh once it finishes.
+            </p>
+          </>
+        )}
         <button type="button" onClick={onRefresh} disabled={refreshing}>
           {refreshing ? "Refreshing…" : "Refresh"}
         </button>
@@ -223,11 +238,21 @@ export function VerificationPanel({
 
       {verification.status === "failed" && (
         <div className="callout callout--error" role="alert">
-          <strong>The verification could not run.</strong>
+          <strong>The verification could not run to completion.</strong>
           <p>{verification.error_message}</p>
           {verification.error_kind !== null && (
             <p className="small muted">Reason: {verification.error_kind}</p>
           )}
+        </div>
+      )}
+
+      {verification.status === "interrupted" && (
+        <div className="callout callout--warn" role="note">
+          <strong>The verification was interrupted.</strong>
+          <p>{verification.error_message}</p>
+          <p className="small muted">
+            Its containers were removed. No result was recorded and none is implied.
+          </p>
         </div>
       )}
 

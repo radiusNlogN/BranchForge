@@ -1,23 +1,30 @@
-"""BranchForge inspection worker — a process separate from the API.
+"""BranchForge workers — processes separate from the API.
 
-    uv run python -m app.worker inspect --run-id <UUID>
+    uv run python -m app.worker inspect     --run-id <UUID>
+    uv run python -m app.worker propose     --run-id <UUID>
+    uv run python -m app.worker verify      --run-id <UUID> | --attempt-id <UUID>
+    uv run python -m app.worker orchestrate --run-id <UUID>
 
 Uses the same DATABASE_URL and the same database layer (`app.repository`) as the
 API, but imports nothing from `app.main` or `app.routers`.
 
 Transaction discipline, which matters because SQLite is the local database:
 
-1. A short session claims the run atomically and commits, then closes.
-2. All GitHub work happens with **no** session open and no transaction held.
+1. A short session claims the work atomically and commits, then closes.
+2. All GitHub, model, and container work happens with **no** session open.
 3. A second short session stores the outcome in a single commit.
 
-Nothing here schedules work, retries, or recovers stuck runs. If the process is
-killed mid-inspection, the run stays `inspecting` — see the README limitations.
+Nothing here schedules work, retries, or durably recovers stuck work. If the
+process is killed mid-inspection, the run stays `inspecting` — see the README
+limitations. An orchestrator reconciles its own children; nothing reconciles an
+orchestrator that is itself killed with SIGKILL.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -32,7 +39,13 @@ from app.database import SessionLocal
 from app.github_client import ClientLimits, GitHubClient, GitHubError
 from app.inspection import inspect_repository
 from app.model_client import AnthropicModelClient, ModelClient, ModelNotConfigured
-from app.models import ATTEMPT_STATUS_SUCCEEDED, RUN_STATUS_PENDING, RUN_STATUS_READY
+from app.models import (
+    ATTEMPT_STATUS_SUCCEEDED,
+    ORCH_STATUS_QUEUED,
+    ORCH_STATUS_RUNNING,
+    RUN_STATUS_PENDING,
+    RUN_STATUS_READY,
+)
 from app import snapshot as snapshot_module
 from app.schemas import InspectionReport
 from app.time_utils import utcnow
@@ -47,6 +60,10 @@ EXIT_NOT_CONFIGURED = 5
 EXIT_VERIFICATION_FAILED = 1
 EXIT_NO_PATCH = 4
 EXIT_DOCKER_UNAVAILABLE = 6
+EXIT_LEGACY_ATTEMPTS = 7
+EXIT_AMBIGUOUS = 8
+EXIT_ORCHESTRATION_FAILED = 1
+EXIT_INTERRUPTED = 130
 
 SessionFactory = Callable[[], Session] | sessionmaker[Session]
 ClientFactory = Callable[[Settings], GitHubClient]
@@ -192,6 +209,102 @@ def inspect_run(
     return EXIT_OK
 
 
+# --- Proposal ----------------------------------------------------------------
+
+
+def _run_proposal(
+    *,
+    attempt_id: str,
+    run_id: str,
+    repository_url: str,
+    issue_description: str,
+    report: InspectionReport,
+    commit_sha: str | None,
+    emphasis: str | None,
+    model: ModelClient,
+    session_factory: SessionFactory,
+    client_factory: ClientFactory,
+    config: Settings,
+    emit: Callable[[str], None],
+) -> int:
+    """Agent work for an already-claimed attempt, then its outcome in one commit.
+
+    Shared by the manual `propose` command and orchestrated attempts. No session
+    is held open across model or GitHub calls; events are committed as they
+    happen so the dashboard can show progress mid-attempt.
+    """
+
+    def record(kind: str, summary: str, detail: str | None) -> None:
+        """Commit one event immediately, in its own short transaction."""
+        with _session(session_factory) as event_db:
+            repository.record_attempt_event(
+                event_db,
+                attempt_id=attempt_id,
+                kind=kind,
+                summary=summary,
+                detail=detail,
+                max_events=config.agent_max_events,
+                max_detail_chars=config.agent_max_event_detail_chars,
+            )
+        emit(f"  · {summary}")
+
+    github = client_factory(config)
+    try:
+        try:
+            result = agent.run_agent(
+                model=model,
+                github=github,
+                repository_url=repository_url,
+                issue_description=issue_description,
+                report=report,
+                commit_sha=commit_sha or "",
+                config=config,
+                record=record,
+                emphasis=emphasis,
+            )
+        finally:
+            closer = getattr(github, "_client", None)
+            if closer is not None:
+                closer.close()
+    except AgentFailure as failure:
+        with _session(session_factory) as db:
+            repository.save_attempt_failure(
+                db,
+                attempt_id=attempt_id,
+                error_kind=failure.kind,
+                error_message=str(failure),
+                input_tokens=None,
+                output_tokens=None,
+                max_error_chars=config.agent_max_error_chars,
+            )
+        emit(f"Attempt failed ({failure.kind}): {failure}")
+        emit(f"Run {run_id} is still 'ready' — inspection is unaffected.")
+        return EXIT_ATTEMPT_FAILED
+
+    with _session(session_factory) as db:
+        repository.save_attempt_success(
+            db,
+            attempt_id=attempt_id,
+            diff=result.patch.diff,
+            summary=result.patch.summary,
+            suggested_test_command=result.patch.suggested_test_command,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            max_summary_chars=config.agent_max_summary_chars,
+            max_command_chars=config.agent_max_test_command_chars,
+        )
+
+    emit(
+        f"Proposed a patch touching {len(result.patch.files_changed)} file(s): "
+        + ", ".join(result.patch.files_changed)
+    )
+    if result.input_tokens is not None or result.output_tokens is not None:
+        emit(f"  tokens: in={result.input_tokens} out={result.output_tokens}")
+    emit(f"  suggested test command: {result.patch.suggested_test_command}")
+    emit("UNVERIFIED: the patch was not applied and no tests were run.")
+    return EXIT_OK
+
+
 def propose_patch(
     run_id: str,
     *,
@@ -201,13 +314,11 @@ def propose_patch(
     config: Settings | None = None,
     out: Any = sys.stdout,
 ) -> int:
-    """Run one bounded agent attempt to propose a patch for an inspected run.
+    """Run one manual, bounded agent attempt to propose a patch for a run.
 
-    Transaction discipline matches the inspect command: short sessions only, and
-    no session held open across model or GitHub calls. Operational events are
-    committed as they happen so the dashboard can show progress mid-attempt.
-
-    The proposed patch is never applied and no repository code is executed.
+    The manual path: attempt index 1, no orchestration, no emphasis — the prompt
+    is exactly what milestone 3 sent. Refused for a run that already has any
+    attempt, orchestrated or not.
     """
     session_factory = session_factory or SessionLocal
     client_factory = client_factory or default_client_factory
@@ -238,6 +349,16 @@ def propose_patch(
             )
             return EXIT_NOT_READY
 
+        existing = repository.list_attempts_for_run(db, run_id)
+        if existing:
+            orchestrated = repository.get_orchestration_for_run(db, run_id) is not None
+            emit(
+                f"Run {run_id} already has a patch attempt"
+                + (" (created by `orchestrate`)" if orchestrated else "")
+                + ". Exiting without calling the model."
+            )
+            return EXIT_NOT_CLAIMED
+
         repository_url = run.repository_url
         issue_description = run.issue_description
         commit_sha = inspection.commit_sha
@@ -259,8 +380,8 @@ def propose_patch(
         )
         if attempt is None:
             emit(
-                f"Run {run_id} already has a patch attempt. One attempt per run in "
-                f"this milestone; exiting without calling the model."
+                f"Run {run_id} already has a patch attempt. Exiting without calling "
+                f"the model."
             )
             return EXIT_NOT_CLAIMED
         attempt_id = attempt.id
@@ -269,93 +390,151 @@ def propose_patch(
     emit(f"Model: {model.model} | commit {commit_sha}")
     emit("Proposing a patch (read-only; nothing is applied or executed)")
 
-    # --- 4. Agent work, with no session held open ----------------------------
-    def record(kind: str, summary: str, detail: str | None) -> None:
-        """Commit one event immediately, in its own short transaction."""
-        with _session(session_factory) as event_db:
-            repository.record_attempt_event(
-                event_db,
-                attempt_id=attempt_id,
-                kind=kind,
-                summary=summary,
-                detail=detail,
-                max_events=config.agent_max_events,
-                max_detail_chars=config.agent_max_event_detail_chars,
-            )
-        emit(f"  · {summary}")
-
-    github = client_factory(config)
-    try:
-        try:
-            result = agent.run_agent(
-                model=model,
-                github=github,
-                repository_url=repository_url,
-                issue_description=issue_description,
-                report=report,
-                commit_sha=commit_sha or "",
-                config=config,
-                record=record,
-            )
-        finally:
-            closer = getattr(github, "_client", None)
-            if closer is not None:
-                closer.close()
-    except AgentFailure as failure:
-        with _session(session_factory) as db:
-            repository.save_attempt_failure(
-                db,
-                attempt_id=attempt_id,
-                error_kind=failure.kind,
-                error_message=str(failure),
-                input_tokens=None,
-                output_tokens=None,
-                max_error_chars=config.agent_max_error_chars,
-            )
-        emit(f"Attempt failed ({failure.kind}): {failure}")
-        emit(f"Run {run_id} is still 'ready' — inspection is unaffected.")
-        return EXIT_ATTEMPT_FAILED
-
-    # --- 5. Patch and success status, one transaction ------------------------
-    with _session(session_factory) as db:
-        repository.save_attempt_success(
-            db,
-            attempt_id=attempt_id,
-            diff=result.patch.diff,
-            summary=result.patch.summary,
-            suggested_test_command=result.patch.suggested_test_command,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            max_summary_chars=config.agent_max_summary_chars,
-            max_command_chars=config.agent_max_test_command_chars,
-        )
-
-    emit(
-        f"Proposed a patch touching {len(result.patch.files_changed)} file(s): "
-        + ", ".join(result.patch.files_changed)
+    # --- 4-5. Agent work and outcome -----------------------------------------
+    return _run_proposal(
+        attempt_id=attempt_id,
+        run_id=run_id,
+        repository_url=repository_url,
+        issue_description=issue_description,
+        report=report,
+        commit_sha=commit_sha,
+        emphasis=None,
+        model=model,
+        session_factory=session_factory,
+        client_factory=client_factory,
+        config=config,
+        emit=emit,
     )
-    if result.input_tokens is not None or result.output_tokens is not None:
-        emit(f"  tokens: in={result.input_tokens} out={result.output_tokens}")
-    emit(f"  suggested test command: {result.patch.suggested_test_command}")
-    emit("UNVERIFIED: the patch was not applied and no tests were run.")
-    return EXIT_OK
 
 
-def verify_patch(
-    run_id: str,
+def _load_orchestrated_attempt(
+    db: Session, attempt_id: str, orchestration_id: str
+) -> tuple[Any, Any, Any] | str:
+    """The attempt, its orchestration, and its run — or why they don't match.
+
+    A child's command-line arguments are checked against the database, never
+    trusted: the hidden `run-attempt` subcommand is still callable by anyone.
+    """
+    attempt = repository.get_patch_attempt(db, attempt_id)
+    if attempt is None:
+        return f"No attempt found with id {attempt_id!r}."
+    orchestration = repository.get_orchestration(db, orchestration_id)
+    if orchestration is None or attempt.orchestration_id != orchestration.id:
+        return f"Attempt {attempt_id} does not belong to orchestration {orchestration_id}."
+    if orchestration.status not in (ORCH_STATUS_QUEUED, ORCH_STATUS_RUNNING):
+        return f"Orchestration {orchestration_id} is {orchestration.status!r}, not active."
+    run = repository.get_run(db, attempt.run_id)
+    if run is None or run.id != orchestration.run_id:  # pragma: no cover - FK-enforced
+        return "The attempt's run does not match its orchestration."
+    return attempt, orchestration, run
+
+
+def propose_attempt(
+    attempt_id: str,
+    orchestration_id: str,
+    *,
+    session_factory: SessionFactory | None = None,
+    client_factory: ClientFactory | None = None,
+    model_factory: ModelFactory | None = None,
+    config: Settings | None = None,
+    out: Any = sys.stdout,
+) -> int:
+    """Claim one reserved (`queued`) orchestrated attempt by ID and run its agent.
+
+    Uses the orchestration's frozen execution settings, not this process's
+    defaults, so siblings share one model and one set of budgets.
+    """
+    session_factory = session_factory or SessionLocal
+    client_factory = client_factory or default_client_factory
+    model_factory = model_factory or default_model_factory
+    base_config = config or settings
+
+    def emit(message: str) -> None:
+        print(message, file=out, flush=True)
+
+    with _session(session_factory) as db:
+        loaded = _load_orchestrated_attempt(db, attempt_id, orchestration_id)
+        if isinstance(loaded, str):
+            emit(loaded)
+            return EXIT_NOT_CLAIMED
+        attempt, orchestration, run = loaded
+        inspection = repository.get_inspection_for_run(db, run.id)
+        if run.status != RUN_STATUS_READY or inspection is None or not inspection.report:
+            emit(f"Run {run.id} has no usable inspection report.")
+            return EXIT_NOT_READY
+        if not (attempt.commit_sha == orchestration.commit_sha == inspection.commit_sha):
+            emit("The attempt, orchestration, and inspection disagree about the commit.")
+            return EXIT_NOT_READY
+
+        run_id = run.id
+        repository_url = run.repository_url
+        issue_description = run.issue_description
+        commit_sha = orchestration.commit_sha
+        report = InspectionReport.model_validate(inspection.report)
+        emphasis = attempt.emphasis_text
+        expected_model = orchestration.model
+        frozen = dict(orchestration.execution_config)
+
+    frozen_config = base_config.with_execution_config(frozen)
+    try:
+        model = model_factory(frozen_config)
+    except ModelNotConfigured as error:
+        emit(f"Model is not configured: {error}")
+        return EXIT_NOT_CONFIGURED
+    if model.model != expected_model:
+        emit(
+            f"This process would use model {model.model!r}, but the orchestration froze "
+            f"{expected_model!r}. Refusing to run a mismatched sibling."
+        )
+        return EXIT_NOT_CONFIGURED
+
+    with _session(session_factory) as db:
+        if not repository.claim_queued_attempt(
+            db, attempt_id=attempt_id, orchestration_id=orchestration_id, model=model.model
+        ):
+            emit(f"Attempt {attempt_id} is not queued; another process claimed it.")
+            return EXIT_NOT_CLAIMED
+
+    emit(f"Claimed attempt {attempt_id} (orchestration {orchestration_id})")
+    return _run_proposal(
+        attempt_id=attempt_id,
+        run_id=run_id,
+        repository_url=repository_url,
+        issue_description=issue_description,
+        report=report,
+        commit_sha=commit_sha,
+        emphasis=emphasis,
+        model=model,
+        session_factory=session_factory,
+        client_factory=client_factory,
+        config=frozen_config,
+        emit=emit,
+    )
+
+
+# --- Verification --------------------------------------------------------------
+
+
+def verify_attempt(
+    attempt_id: str,
     *,
     session_factory: SessionFactory | None = None,
     config: Settings | None = None,
     image_id: str | None = None,
     snapshot_fetcher: Any = None,
     test_runner: Any = None,
+    workspace_root: str | None = None,
+    labels: dict[str, str] | None = None,
     out: Any = sys.stdout,
 ) -> int:
-    """Run the proposed patch against the repository's own tests in containers.
+    """Run one attempt's proposed patch against the repository's own tests.
 
     Ordering matters and mirrors `propose`: everything that can fail cheaply is
     checked *before* the claim, so a missing image or a stopped Docker daemon
     never leaves a claimed verification behind.
+
+    For an orchestrated attempt, the orchestration's frozen settings and image ID
+    apply, so a manual re-check stays comparable with its siblings.
 
     Repository code executes only inside the container. This process orchestrates
     and never imports, installs, or runs anything from the repository.
@@ -364,26 +543,20 @@ def verify_patch(
     config = config or settings
 
     def emit(message: str) -> None:
-        print(message, file=out)
+        print(message, file=out, flush=True)
 
     # --- 1. Preconditions, in a short read-only session ----------------------
     with _session(session_factory) as db:
-        run = repository.get_run(db, run_id)
-        if run is None:
-            emit(f"No run found with id {run_id!r}.")
-            return EXIT_RUN_NOT_FOUND
-
-        attempt = repository.get_patch_attempt_for_run(db, run_id)
+        attempt = repository.get_patch_attempt(db, attempt_id)
         if attempt is None:
-            emit(
-                f"Run {run_id} has no patch attempt to verify. Propose one first:\n"
-                f"  uv run python -m app.worker propose --run-id {run_id}"
-            )
-            return EXIT_NO_PATCH
+            emit(f"No attempt found with id {attempt_id!r}.")
+            return EXIT_RUN_NOT_FOUND
+        run = repository.get_run(db, attempt.run_id)
+        run_id = attempt.run_id
         if attempt.status != ATTEMPT_STATUS_SUCCEEDED or not attempt.diff:
             emit(
-                f"The patch attempt for run {run_id} is {attempt.status!r} with no "
-                f"stored diff. There is nothing to verify."
+                f"The patch attempt {attempt_id} for run {run_id} is {attempt.status!r} "
+                f"with no stored diff. There is nothing to verify."
             )
             return EXIT_NO_PATCH
         if not attempt.commit_sha:
@@ -393,7 +566,12 @@ def verify_patch(
             )
             return EXIT_NO_PATCH
 
-        attempt_id = attempt.id
+        if attempt.orchestration_id is not None:
+            orchestration = repository.get_orchestration(db, attempt.orchestration_id)
+            if orchestration is not None:
+                config = config.with_execution_config(dict(orchestration.execution_config))
+                image_id = image_id or orchestration.image_id
+
         diff = attempt.diff
         commit_sha = attempt.commit_sha
         repository_url = run.repository_url
@@ -422,13 +600,13 @@ def verify_patch(
         )
         if claimed is None:
             emit(
-                f"Run {run_id} already has a verification. One verification per patch "
-                f"in this milestone; exiting without starting any container."
+                f"Attempt {attempt_id} already has a verification. One verification per "
+                f"patch; exiting without starting any container."
             )
             return EXIT_NOT_CLAIMED
         verification_id = claimed.id
 
-    emit(f"Claimed verification for run {run_id}")
+    emit(f"Claimed verification for run {run_id} (attempt {attempt_id})")
     emit(f"Profile: {config.verify_profile} | image {config.verify_image} ({resolved_image_id[:19]})")
     emit(f"Commit: {commit_sha}")
     emit("Repository code runs only inside a disposable container with no network.")
@@ -447,6 +625,8 @@ def verify_patch(
             record=record,
             snapshot_fetcher=snapshot_fetcher,
             test_runner=test_runner,
+            workspace_root=workspace_root,
+            labels=labels,
         )
     except (snapshot_module.SnapshotError, runner.RunnerError) as error:
         with _session(session_factory) as db:
@@ -513,16 +693,158 @@ def verify_patch(
     return EXIT_OK
 
 
+def verify_patch(
+    run_id: str,
+    *,
+    session_factory: SessionFactory | None = None,
+    config: Settings | None = None,
+    image_id: str | None = None,
+    snapshot_fetcher: Any = None,
+    test_runner: Any = None,
+    out: Any = sys.stdout,
+) -> int:
+    """`verify --run-id`: verify the run's only attempt.
+
+    Unambiguous runs behave exactly as in milestone 4. A run with several
+    attempts is refused with the IDs to choose from — guessing would verify the
+    wrong patch.
+    """
+    session_factory = session_factory or SessionLocal
+
+    def emit(message: str) -> None:
+        print(message, file=out)
+
+    with _session(session_factory) as db:
+        run = repository.get_run(db, run_id)
+        if run is None:
+            emit(f"No run found with id {run_id!r}.")
+            return EXIT_RUN_NOT_FOUND
+        try:
+            attempt = repository.get_patch_attempt_for_run(db, run_id)
+        except repository.AmbiguousAttempt as ambiguous:
+            emit(
+                f"Run {run_id} has {len(ambiguous.attempt_ids)} attempts, so --run-id is "
+                f"ambiguous. Verify one explicitly:"
+            )
+            for candidate in ambiguous.attempt_ids:
+                emit(f"  uv run python -m app.worker verify --attempt-id {candidate}")
+            return EXIT_AMBIGUOUS
+        if attempt is None:
+            emit(
+                f"Run {run_id} has no patch attempt to verify. Propose one first:\n"
+                f"  uv run python -m app.worker propose --run-id {run_id}"
+            )
+            return EXIT_NO_PATCH
+        attempt_id = attempt.id
+
+    return verify_attempt(
+        attempt_id,
+        session_factory=session_factory,
+        config=config,
+        image_id=image_id,
+        snapshot_fetcher=snapshot_fetcher,
+        test_runner=test_runner,
+        out=out,
+    )
+
+
+# --- One orchestrated pipeline (the child process) ------------------------------
+
+
+def run_attempt_pipeline(
+    attempt_id: str,
+    orchestration_id: str,
+    *,
+    session_factory: SessionFactory | None = None,
+    client_factory: ClientFactory | None = None,
+    model_factory: ModelFactory | None = None,
+    config: Settings | None = None,
+    snapshot_fetcher: Any = None,
+    test_runner: Any = None,
+    after_proposal: Callable[[], None] | None = None,
+    out: Any = sys.stdout,
+) -> int:
+    """Propose, then verify, one orchestrated attempt. Runs inside a child process.
+
+    The workspace root, container labels, image ID, and settings all come from
+    the orchestration row — never from arguments — after the attempt is proven to
+    belong to it. The exit code is informational only: the coordinator decides
+    what happened from the database.
+
+    `after_proposal` is a test seam at the boundary between the saved proposal and
+    the verification claim, where a crash must be reconciled correctly.
+    """
+    session_factory = session_factory or SessionLocal
+    base_config = config or settings
+
+    code = propose_attempt(
+        attempt_id,
+        orchestration_id,
+        session_factory=session_factory,
+        client_factory=client_factory,
+        model_factory=model_factory,
+        config=base_config,
+        out=out,
+    )
+    if code != EXIT_OK:
+        return code
+
+    if after_proposal is not None:
+        after_proposal()
+
+    with _session(session_factory) as db:
+        loaded = _load_orchestrated_attempt(db, attempt_id, orchestration_id)
+        if isinstance(loaded, str):
+            print(loaded, file=out, flush=True)
+            return EXIT_NOT_CLAIMED
+        attempt, orchestration, _run = loaded
+        workspace_root = os.path.join(
+            orchestration.workspace_root, f"attempt-{attempt.attempt_index}"
+        )
+        image_id = orchestration.image_id
+        frozen_config = base_config.with_execution_config(dict(orchestration.execution_config))
+
+    os.makedirs(workspace_root, mode=0o700, exist_ok=True)
+    return verify_attempt(
+        attempt_id,
+        session_factory=session_factory,
+        config=frozen_config,
+        image_id=image_id,
+        snapshot_fetcher=snapshot_fetcher,
+        test_runner=test_runner,
+        workspace_root=workspace_root,
+        labels={
+            runner.LABEL_ORCHESTRATION: orchestration_id,
+            runner.LABEL_ATTEMPT: attempt_id,
+        },
+        out=out,
+    )
+
+
+def install_child_signal_handlers() -> None:
+    """SIGTERM raises SystemExit so `finally` blocks run (workspace cleanup)."""
+
+    def _terminate(signum: int, frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _terminate)
+
+
+# --- CLI -----------------------------------------------------------------------
+
+PUBLIC_COMMANDS = "{inspect,propose,verify,orchestrate}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.worker",
         description=(
-            "BranchForge inspection worker. Reads a public GitHub repository "
-            "through the API and stores a report. Never clones or executes "
-            "repository code."
+            "BranchForge workers. Inspect a public GitHub repository, propose "
+            "patches, and verify them in containers. Repository code runs only "
+            "inside containers, never on the host."
         ),
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar=PUBLIC_COMMANDS)
 
     inspect_parser = subparsers.add_parser(
         "inspect", help="Inspect the repository for one pending run."
@@ -533,7 +855,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     propose_parser = subparsers.add_parser(
         "propose",
-        help="Propose a patch for one inspected run using the configured model.",
+        help="Propose one patch for an inspected run using the configured model.",
     )
     propose_parser.add_argument(
         "--run-id", required=True, help="UUID of an inspected ('ready') run."
@@ -541,11 +863,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify_parser = subparsers.add_parser(
         "verify",
-        help="Apply the proposed patch and run the repository's tests in Docker.",
+        help="Apply one proposed patch and run the repository's tests in Docker.",
     )
-    verify_parser.add_argument(
-        "--run-id", required=True, help="UUID of a run with a proposed patch."
+    target = verify_parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--run-id", help="UUID of a run with exactly one attempt.")
+    target.add_argument("--attempt-id", help="UUID of a specific attempt.")
+
+    orchestrate_parser = subparsers.add_parser(
+        "orchestrate",
+        help="Run max_parallel_attempts competing attempts, verify each, and compare.",
     )
+    orchestrate_parser.add_argument(
+        "--run-id", required=True, help="UUID of an inspected run with no attempts."
+    )
+
+    # Internal: what an orchestrator launches per attempt. Hidden from the
+    # command list; its arguments are validated against the database.
+    child_parser = subparsers.add_parser("run-attempt")
+    child_parser.add_argument("--attempt-id", required=True)
+    child_parser.add_argument("--orchestration-id", required=True)
     return parser
 
 
@@ -556,7 +892,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "propose":
         return propose_patch(args.run_id)
     if args.command == "verify":
+        if args.attempt_id:
+            return verify_attempt(args.attempt_id)
         return verify_patch(args.run_id)
+    if args.command == "orchestrate":
+        from app.orchestrator import orchestrate_run
+
+        return orchestrate_run(args.run_id)
+    if args.command == "run-attempt":
+        install_child_signal_handlers()
+        return run_attempt_pipeline(args.attempt_id, args.orchestration_id)
     return EXIT_OK  # pragma: no cover - argparse enforces a known command
 
 

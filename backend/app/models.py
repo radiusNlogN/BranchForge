@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,15 +27,32 @@ RUN_STATUS_INSPECTING = "inspecting"
 RUN_STATUS_READY = "ready"
 RUN_STATUS_FAILED = "failed"
 
-# Patch-attempt lifecycle. Deliberately SEPARATE from the run status: a run stays
-# `ready` (meaning inspection succeeded) whether an attempt succeeds or fails.
+# Verification lifecycle: did the verification itself run? Separate from what it
+# found (`outcome`). `interrupted` is written only when an orchestrator stopped
+# the child that was running it.
 VERIFY_STATUS_RUNNING = "running"
 VERIFY_STATUS_COMPLETED = "completed"
 VERIFY_STATUS_FAILED = "failed"
+VERIFY_STATUS_INTERRUPTED = "interrupted"
 
+# Patch-attempt lifecycle. Deliberately SEPARATE from the run status: a run stays
+# `ready` (meaning inspection succeeded) whether an attempt succeeds or fails.
+# It describes the *proposal* only. `queued` exists for orchestrator-reserved
+# slots that no child has claimed yet.
+ATTEMPT_STATUS_QUEUED = "queued"
 ATTEMPT_STATUS_RUNNING = "running"
 ATTEMPT_STATUS_SUCCEEDED = "succeeded"
 ATTEMPT_STATUS_FAILED = "failed"
+ATTEMPT_STATUS_INTERRUPTED = "interrupted"
+
+# Orchestration lifecycle. `failed` means the coordinator itself failed (or could
+# not confirm container cleanup) — not that attempts failed; attempt outcomes
+# live on the attempts.
+ORCH_STATUS_QUEUED = "queued"
+ORCH_STATUS_RUNNING = "running"
+ORCH_STATUS_COMPLETED = "completed"
+ORCH_STATUS_INTERRUPTED = "interrupted"
+ORCH_STATUS_FAILED = "failed"
 
 MIN_PARALLEL_ATTEMPTS = 1
 MAX_PARALLEL_ATTEMPTS = 3
@@ -80,7 +98,12 @@ class Run(Base):
     inspection: Mapped["Inspection | None"] = relationship(
         back_populates="run", uselist=False, cascade="all, delete-orphan"
     )
-    patch_attempt: Mapped["PatchAttempt | None"] = relationship(
+    attempts: Mapped[list["PatchAttempt"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        order_by="PatchAttempt.attempt_index",
+    )
+    orchestration: Mapped["Orchestration | None"] = relationship(
         back_populates="run", uselist=False, cascade="all, delete-orphan"
     )
 
@@ -136,17 +159,27 @@ class Inspection(Base):
         return f"<Inspection run_id={self.run_id!r} sha={self.commit_sha!r}>"
 
 
-class PatchAttempt(Base):
-    """One bounded agent attempt to propose a patch for a run.
+class Orchestration(Base):
+    """One run of competing attempts for a run.
 
-    `run_id` is UNIQUE, which is what makes creating the row an atomic claim:
-    two workers racing to start an attempt cannot both insert, so only one ever
-    calls the model. One attempt per inspected run in this milestone.
+    `run_id` is UNIQUE: inserting this row, together with its reserved attempt
+    slots in the same commit, *is* the claim. Two orchestrators targeting one run
+    cannot both succeed, so the loser launches nothing.
 
-    The stored diff is a *proposal*. It is never applied and never tested.
+    Everything a child needs to behave identically to its siblings is frozen here
+    at creation: the model, the effective agent/verification budgets
+    (`execution_config`), the resolved image ID, and the workspace root. Children
+    read these from this row rather than re-reading possibly changed defaults.
     """
 
-    __tablename__ = "patch_attempts"
+    __tablename__ = "orchestrations"
+    __table_args__ = (
+        CheckConstraint(
+            f"requested_attempts >= {MIN_PARALLEL_ATTEMPTS} "
+            f"AND requested_attempts <= {MAX_PARALLEL_ATTEMPTS}",
+            name="ck_orchestrations_requested_attempts",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
@@ -158,6 +191,87 @@ class PatchAttempt(Base):
         unique=True,
         index=True,
     )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ORCH_STATUS_QUEUED, server_default=ORCH_STATUS_QUEUED
+    )
+
+    requested_attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    concurrency_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    effective_concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    commit_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    profile: Mapped[str] = mapped_column(String(40), nullable=False)
+    image_ref: Mapped[str] = mapped_column(String(200), nullable=False)
+    image_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    workspace_root: Mapped[str] = mapped_column(Text, nullable=False)
+    # Frozen settings overrides; contains no credentials (see config.frozen_execution_config).
+    execution_config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+    recommended_attempt_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comparison: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    notes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+
+    error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    run: Mapped["Run"] = relationship(back_populates="orchestration")
+    attempts: Mapped[list["PatchAttempt"]] = relationship(
+        viewonly=True, order_by="PatchAttempt.attempt_index"
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Orchestration run_id={self.run_id!r} status={self.status!r}>"
+
+
+class PatchAttempt(Base):
+    """One bounded agent attempt to propose a patch for a run.
+
+    `(run_id, attempt_index)` is UNIQUE. A manual `propose` inserts index 1 and
+    that insert is its claim; an orchestrator reserves indices 1..N as `queued`
+    rows in the same commit as its orchestration row, and a child then claims one
+    by ID with a conditional UPDATE. Index 1 being contested by both paths is
+    what makes a manual attempt and an orchestration mutually exclusive.
+
+    The stored diff is a *proposal*. `status` describes only the proposal;
+    `pipeline_error_*` records an orchestrated pipeline that stopped before its
+    verification finished (e.g. the child exited between the two steps).
+    """
+
+    __tablename__ = "patch_attempts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "attempt_index", name="uq_patch_attempts_run_attempt_index"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    attempt_index: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    orchestration_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("orchestrations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # The small, recorded difference in investigation emphasis. NULL for manual attempts.
+    emphasis_key: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    emphasis_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=ATTEMPT_STATUS_RUNNING,
@@ -177,14 +291,19 @@ class PatchAttempt(Base):
     error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=utcnow
-    )
+    # Written only by orchestrator reconciliation; never changes `status`.
+    pipeline_error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    pipeline_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # NULL while queued: a reserved slot has not started. No default on purpose —
+    # SQLAlchemy would fire it for an explicit None, giving queued rows a start
+    # time. Claims set it explicitly.
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
-    run: Mapped["Run"] = relationship(back_populates="patch_attempt")
+    run: Mapped["Run"] = relationship(back_populates="attempts")
     verification: Mapped["Verification | None"] = relationship(
         back_populates="attempt", cascade="all, delete-orphan", uselist=False
     )

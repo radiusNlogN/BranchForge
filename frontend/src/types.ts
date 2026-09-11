@@ -107,8 +107,11 @@ export interface Inspection {
   error_message: string | null;
 }
 
-/** Patch-attempt state, independent of the run's own status. */
-export type AttemptStatus = "running" | "succeeded" | "failed";
+/**
+ * Patch-attempt (proposal) state, independent of the run's own status and of
+ * verification. `queued` is a slot an orchestrator reserved but has not started.
+ */
+export type AttemptStatus = "queued" | "running" | "succeeded" | "failed" | "interrupted";
 
 export interface AttemptEvent {
   seq: number;
@@ -119,12 +122,17 @@ export interface AttemptEvent {
 }
 
 /**
- * One agent attempt. `diff` is an UNVERIFIED proposal — it was never applied and
- * no tests were run.
+ * One agent attempt. `diff` is a proposal; whether it improved any test is only
+ * ever stated by its `verification`.
  */
 export interface PatchAttempt {
   id: string;
   run_id: string;
+  attempt_index: number;
+  /** `null` for a manual (`propose`) attempt. */
+  orchestration_id: string | null;
+  emphasis_key: string | null;
+  emphasis_text: string | null;
   status: AttemptStatus;
   model: string;
   commit_sha: string | null;
@@ -135,17 +143,71 @@ export interface PatchAttempt {
   output_tokens: number | null;
   error_kind: string | null;
   error_message: string | null;
-  started_at: string;
+  /** Set when an orchestrated pipeline stopped before its verification finished. */
+  pipeline_error_kind: string | null;
+  pipeline_error_message: string | null;
+  /** `null` while queued. */
+  started_at: string | null;
   completed_at: string | null;
   events: AttemptEvent[];
   events_total: number;
+  verification: Verification | null;
 }
 
-/** The run detail endpoint returns the run plus its inspection and attempt. */
+/** Did the orchestration run to the end? Separate from what its attempts found. */
+export type OrchestrationStatus = "queued" | "running" | "completed" | "interrupted" | "failed";
+
+export interface ComparisonCandidate {
+  attempt_index: number;
+  attempt_id: string;
+  eligible: boolean;
+  reasons: string[];
+  changed_lines: number | null;
+  outcome: string | null;
+}
+
+export interface OrchestrationComparison {
+  rule: string;
+  tie_breaker: string;
+  complete: boolean;
+  recommendation_scope: "all_attempts" | "completed_attempts_only" | null;
+  baselines_consistent: boolean | null;
+  recommended_attempt_index: number | null;
+  recommended_attempt_id: string | null;
+  headline: string;
+  candidates: ComparisonCandidate[];
+  notes: string[];
+}
+
+export interface Orchestration {
+  id: string;
+  run_id: string;
+  status: OrchestrationStatus;
+  requested_attempts: number;
+  concurrency_limit: number;
+  effective_concurrency: number;
+  model: string;
+  commit_sha: string;
+  profile: string;
+  image_ref: string;
+  image_id: string;
+  recommended_attempt_index: number | null;
+  /** Written once, when the orchestration ends. */
+  comparison: OrchestrationComparison | null;
+  notes: string[] | null;
+  error_kind: string | null;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/** The run detail endpoint returns the run plus its inspection, attempts, and orchestration. */
 export interface RunDetail extends Run {
   inspection: Inspection | null;
-  patch_attempt: PatchAttempt | null;
-  verification: Verification | null;
+  orchestration: Orchestration | null;
+  /** Ordered by attempt_index. One element for a manual run. */
+  attempts: PatchAttempt[];
 }
 
 export const MAX_ISSUE_DESCRIPTION_LENGTH = 10_000;
@@ -160,8 +222,12 @@ export function proposeCommand(runId: string): string {
   return `uv run python -m app.worker propose --run-id ${runId}`;
 }
 
+export function orchestrateCommand(runId: string): string {
+  return `uv run python -m app.worker orchestrate --run-id ${runId}`;
+}
+
 /** Did the verification run? Separate from what it found. */
-export type VerificationStatus = "running" | "completed" | "failed";
+export type VerificationStatus = "running" | "completed" | "failed" | "interrupted";
 
 /** One classified container run. */
 export interface RunSummaryData {
@@ -225,6 +291,12 @@ export interface Verification {
   completed_at: string | null;
 }
 
+/** For a run with exactly one attempt. */
 export function verifyCommand(runId: string): string {
   return `uv run python -m app.worker verify --run-id ${runId}`;
+}
+
+/** Unambiguous for any run: names the attempt. */
+export function verifyAttemptCommand(attemptId: string): string {
+  return `uv run python -m app.worker verify --attempt-id ${attemptId}`;
 }

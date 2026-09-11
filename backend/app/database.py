@@ -39,7 +39,9 @@ def _engine_kwargs(database_url: str) -> dict[str, object]:
         # Route handlers that touch the database are sync `def`, so FastAPI runs
         # them in a worker thread; pooled SQLite connections therefore cross
         # threads and the default same-thread check would reject them.
-        return {"connect_args": {"check_same_thread": False}}
+        # `timeout` is SQLite's busy wait: an orchestrator and its children are
+        # several processes writing short transactions to one file.
+        return {"connect_args": {"check_same_thread": False, "timeout": 30}}
     return {}
 
 

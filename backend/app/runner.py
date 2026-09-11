@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -136,6 +137,25 @@ def resolve_image_id(image_ref: str, *, limits: RunnerLimits) -> str:
     )
 
 
+# Ownership labels. Keys are fixed here; values must be runner-owned identifiers
+# (UUIDs), which is what keeps "nothing from the repository reaches the argv" true.
+LABEL_ORCHESTRATION = "branchforge.orchestration"
+LABEL_ATTEMPT = "branchforge.attempt"
+_ALLOWED_LABEL_KEYS = {LABEL_ORCHESTRATION, LABEL_ATTEMPT}
+_LABEL_VALUE = re.compile(r"^[0-9a-f][0-9a-f-]{0,63}$")
+
+
+def _label_args(labels: dict[str, str] | None) -> list[str]:
+    args: list[str] = []
+    for key, value in sorted((labels or {}).items()):
+        if key not in _ALLOWED_LABEL_KEYS:
+            raise ValueError(f"Unknown container label {key!r}.")
+        if not _LABEL_VALUE.match(value):
+            raise ValueError(f"Container label {key!r} must be a runner-owned identifier.")
+        args.extend(["--label", f"{key}={value}"])
+    return args
+
+
 def build_run_argv(
     *,
     workspace: str,
@@ -145,12 +165,14 @@ def build_run_argv(
     limits: RunnerLimits,
     report_max_tests: int = 5000,
     report_max_message_chars: int = 400,
+    labels: dict[str, str] | None = None,
 ) -> list[str]:
     """Build the `docker run` argument vector.
 
     An argument **array**, never an interpolated shell string. Nothing derived
     from the repository, the model, or the issue text reaches this list: the only
-    variable parts are runner-owned paths and the resolved image ID.
+    variable parts are runner-owned paths, the resolved image ID, and ownership
+    labels whose values are validated runner-owned identifiers.
 
     Paths are realpath'd because on macOS `mkdtemp()` returns `/var/folders/...`
     while Docker Desktop only shares the `/private/var/folders/...` it resolves to.
@@ -163,6 +185,9 @@ def build_run_argv(
         "run",
         "--rm",
         "--name", container_name,
+        # Ownership, so an orchestrator can find and remove exactly its own
+        # containers — and nobody else's — if a child dies mid-run.
+        *_label_args(labels),
         # The daemon's own log buffer is not bounded by our reader, so disable it.
         "--log-driver=none",
         # No network at all: repository tests cannot phone home or fetch anything.
@@ -304,6 +329,7 @@ def run_tests(
     limits: RunnerLimits,
     report_max_tests: int = 5000,
     report_max_message_chars: int = 400,
+    labels: dict[str, str] | None = None,
 ) -> RunResult:
     """Run the fixed pytest invocation against `workspace` in a container."""
     container_name = f"branchforge-verify-{uuid.uuid4().hex[:16]}"
@@ -315,6 +341,7 @@ def run_tests(
         limits=limits,
         report_max_tests=report_max_tests,
         report_max_message_chars=report_max_message_chars,
+        labels=labels,
     )
 
     # The container writes the report here as UID 65534, so the directory has to
@@ -402,6 +429,59 @@ def run_tests(
         cleanup_errors=cleanup_errors,
         container_name=container_name,
     )
+
+
+@dataclass
+class LabelledCleanup:
+    """What a labelled-container sweep found, removed, and could confirm."""
+
+    confirmed: bool
+    removed: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def _list_labelled(key: str, value: str, limits: RunnerLimits) -> list[str]:
+    completed = _docker(
+        ["ps", "-a", "-q", "--no-trunc", "--filter", f"label={key}={value}"], limits
+    )
+    if completed.returncode != 0:
+        raise DockerUnavailable(
+            f"`docker ps` failed: {(completed.stderr or '').strip()[:200]}"
+        )
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def remove_labelled_containers(key: str, value: str, *, limits: RunnerLimits) -> LabelledCleanup:
+    """Force-remove every container carrying exactly this ownership label.
+
+    Filtering by one label key *and value* is what keeps this from touching other
+    orchestrations' containers or unlabelled ones. The result is only `confirmed`
+    when a second listing after removal comes back empty — a removal command
+    returning is not proof the container is gone.
+    """
+    if key not in _ALLOWED_LABEL_KEYS or not _LABEL_VALUE.match(value):
+        raise ValueError("Refusing to sweep containers without a valid ownership label.")
+
+    errors: list[str] = []
+    removed: list[str] = []
+    try:
+        found = _list_labelled(key, value, limits)
+    except DockerUnavailable as error:
+        return LabelledCleanup(confirmed=False, errors=[str(error)])
+
+    for container_id in found:
+        before = len(errors)
+        _force_remove(container_id, limits, errors)
+        if len(errors) == before:
+            removed.append(container_id)
+
+    try:
+        remaining = _list_labelled(key, value, limits)
+    except DockerUnavailable as error:
+        return LabelledCleanup(confirmed=False, removed=removed, errors=[*errors, str(error)])
+    if remaining:
+        errors.append(f"{len(remaining)} labelled container(s) still present after removal.")
+    return LabelledCleanup(confirmed=not remaining, removed=removed, errors=errors)
 
 
 def docker_available(limits: RunnerLimits | None = None) -> bool:

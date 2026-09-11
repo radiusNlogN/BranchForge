@@ -667,7 +667,7 @@ def _default_snapshot_fetcher(config: Settings) -> SnapshotFetcher:
     return fetch
 
 
-def _default_test_runner(config: Settings) -> TestRunner:
+def _default_test_runner(config: Settings, labels: dict[str, str] | None = None) -> TestRunner:
     limits = runner_limits_from(config)
 
     def run(*, workspace: str, results_dir: str, image_id: str) -> RunResult:
@@ -678,6 +678,7 @@ def _default_test_runner(config: Settings) -> TestRunner:
             limits=limits,
             report_max_tests=config.verify_report_max_tests,
             report_max_message_chars=config.verify_report_max_message_chars,
+            labels=labels,
         )
 
     return run
@@ -708,15 +709,19 @@ def run_verification(
     snapshot_fetcher: SnapshotFetcher | None = None,
     test_runner: TestRunner | None = None,
     workspace_root: str | None = None,
+    labels: dict[str, str] | None = None,
 ) -> VerificationResult:
     """Snapshot, baseline, apply, compare — and clean up whatever happens.
 
     Workspaces are runner-owned temporary directories. The user's BranchForge
     checkout is never touched, and nothing is written inside the repository under
     verification except by `git apply` into a throwaway copy.
+
+    `labels` mark every container this verification starts with its owner, so an
+    orchestrator can remove them if the process running this is killed.
     """
     snapshot_fetcher = snapshot_fetcher or _default_snapshot_fetcher(config)
-    test_runner = test_runner or _default_test_runner(config)
+    test_runner = test_runner or _default_test_runner(config, labels)
 
     ref = parse_repository_url(repository_url)
     owned_root = workspace_root is None

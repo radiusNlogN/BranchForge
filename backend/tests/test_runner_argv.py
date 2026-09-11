@@ -218,6 +218,91 @@ def test_no_repository_or_model_supplied_text_reaches_the_argv(tmp_path):
         )
 
 
+# --- Ownership labels (milestone 5) -----------------------------------------
+
+ORCH_ID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+ATTEMPT_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def test_ownership_labels_are_present_when_given(tmp_path):
+    argv = build_run_argv(
+        workspace=str(tmp_path), results_dir=str(tmp_path / "r"), image_id="sha256:x",
+        container_name="branchforge-verify-x", limits=RunnerLimits(),
+        labels={runner.LABEL_ORCHESTRATION: ORCH_ID, runner.LABEL_ATTEMPT: ATTEMPT_ID},
+    )
+    labels = [argv[i + 1] for i, a in enumerate(argv) if a == "--label"]
+    assert labels == [
+        f"branchforge.attempt={ATTEMPT_ID}",
+        f"branchforge.orchestration={ORCH_ID}",
+    ]
+    # Still exactly the same isolation flags and mounts.
+    assert "--network=none" in argv and len([a for a in argv if a == "-v"]) == 2
+
+
+def test_no_labels_are_added_for_a_manual_verification(argv):
+    assert "--label" not in argv
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"com.example.other": ORCH_ID},
+        {runner.LABEL_ATTEMPT: "Robert'); DROP TABLE"},
+        {runner.LABEL_ATTEMPT: "$(whoami)"},
+        {runner.LABEL_ATTEMPT: ""},
+    ],
+)
+def test_label_values_must_be_runner_owned_identifiers(tmp_path, labels):
+    with pytest.raises(ValueError):
+        build_run_argv(
+            workspace=str(tmp_path), results_dir=str(tmp_path / "r"), image_id="sha256:x",
+            container_name="c", limits=RunnerLimits(), labels=labels,
+        )
+
+
+def test_labelled_cleanup_filters_on_exactly_one_label_and_confirms(monkeypatch):
+    calls: list[list[str]] = []
+    listings = iter(["abc123\ndef456\n", ""])
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[1] == "ps":
+            return subprocess.CompletedProcess(args, 0, next(listings), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = runner.remove_labelled_containers(runner.LABEL_ORCHESTRATION, ORCH_ID, limits=RunnerLimits())
+
+    assert result.confirmed is True and result.removed == ["abc123", "def456"]
+    ps_calls = [c for c in calls if c[1] == "ps"]
+    assert len(ps_calls) == 2, "removal must be confirmed by a second listing"
+    for call in ps_calls:
+        assert call[call.index("--filter") + 1] == f"label=branchforge.orchestration={ORCH_ID}"
+    assert [c[1:] for c in calls if c[1] == "rm"] == [["rm", "-f", "abc123"], ["rm", "-f", "def456"]]
+
+
+def test_labelled_cleanup_is_unconfirmed_when_containers_remain_or_docker_fails(monkeypatch):
+    def still_there(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "abc123\n" if args[1] == "ps" else "", "")
+
+    monkeypatch.setattr(subprocess, "run", still_there)
+    assert runner.remove_labelled_containers(
+        runner.LABEL_ATTEMPT, ATTEMPT_ID, limits=RunnerLimits()
+    ).confirmed is False
+
+    def broken(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, "", "Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr(subprocess, "run", broken)
+    result = runner.remove_labelled_containers(runner.LABEL_ATTEMPT, ATTEMPT_ID, limits=RunnerLimits())
+    assert result.confirmed is False and result.errors
+
+
+def test_labelled_cleanup_refuses_an_invalid_label():
+    with pytest.raises(ValueError):
+        runner.remove_labelled_containers("branchforge.attempt", "", limits=RunnerLimits())
+
+
 # --- Report reading ---------------------------------------------------------
 
 

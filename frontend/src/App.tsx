@@ -126,7 +126,7 @@ export default function App() {
               </p>
             </div>
           </div>
-          <span className="pill">milestone 1 · intake only</span>
+          <span className="pill">milestone 5 · competing attempts</span>
         </div>
       </header>
 

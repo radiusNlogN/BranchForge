@@ -15,6 +15,7 @@ from app.database import get_db
 from app.schemas import (
     AttemptEventRead,
     InspectionRead,
+    OrchestrationRead,
     PatchAttemptRead,
     RunCreate,
     RunDetailRead,
@@ -62,11 +63,11 @@ def get_run(
     run_id: str = Path(description="Server-generated run UUID."),
     db: Session = Depends(get_db),
 ) -> RunDetailRead:
-    """Return one run with its inspection, attempt, and verification, or 404.
+    """Return one run with its inspection, attempts, and orchestration, or 404.
 
-    Each is `null` until the corresponding worker command has run. The response
-    stays bounded because the workers' budgets bound what they write, and the
-    attempt's event list is capped here as well.
+    Each is empty/`null` until the corresponding worker command has run. The
+    response stays bounded: at most three attempts, the workers' budgets bound
+    what they write, and each attempt's event list is capped here as well.
     """
     run = repository.get_run(db, run_id)
     if run is None:
@@ -75,25 +76,26 @@ def get_run(
             detail=f"No run found with id {run_id!r}.",
         )
 
-    detail = RunDetailRead.model_validate(run)
+    # Validated from the plain RunRead, not the ORM row: the row's `attempts` and
+    # `orchestration` relationships would otherwise be copied in without events
+    # or verifications, and then duplicated below.
+    detail = RunDetailRead.model_validate(RunRead.model_validate(run), from_attributes=True)
 
     inspection = repository.get_inspection_for_run(db, run_id)
     if inspection is not None:
         detail.inspection = InspectionRead.model_validate(inspection)
 
-    attempt = repository.get_patch_attempt_for_run(db, run_id)
-    if attempt is not None:
-        events = repository.list_attempt_events(
-            db, attempt.id, limit=settings.agent_max_events
-        )
-        detail.patch_attempt = PatchAttemptRead.model_validate(attempt)
-        detail.patch_attempt.events = [
-            AttemptEventRead.model_validate(event) for event in events
-        ]
-        detail.patch_attempt.events_total = repository.count_attempt_events(db, attempt.id)
+    orchestration = repository.get_orchestration_for_run(db, run_id)
+    if orchestration is not None:
+        detail.orchestration = OrchestrationRead.model_validate(orchestration)
 
-        verification = repository.get_verification_for_attempt(db, attempt.id)
+    for attempt, verification in repository.list_attempts_with_verifications(db, run_id):
+        item = PatchAttemptRead.model_validate(attempt)
+        events = repository.list_attempt_events(db, attempt.id, limit=settings.agent_max_events)
+        item.events = [AttemptEventRead.model_validate(event) for event in events]
+        item.events_total = repository.count_attempt_events(db, attempt.id)
         if verification is not None:
-            detail.verification = VerificationRead.model_validate(verification)
+            item.verification = VerificationRead.model_validate(verification)
+        detail.attempts.append(item)
 
     return detail

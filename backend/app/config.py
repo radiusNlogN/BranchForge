@@ -5,9 +5,11 @@ directly. DATABASE_URL is the single source of truth for the database, shared by
 the app and by Alembic.
 """
 
+import os
 from functools import lru_cache
+from typing import Any
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
@@ -134,6 +136,18 @@ class Settings(BaseSettings):
     verify_report_max_message_chars: int = 400
     verify_max_error_chars: int = 2_000
 
+    # --- Orchestration (milestone 5) ----------------------------------------
+    # How many attempt pipelines ONE orchestrator process runs at once. The
+    # effective value is min(this, the run's max_parallel_attempts). It is not a
+    # global limit: two orchestrators for two runs each get their own.
+    orchestrator_max_concurrency: int = Field(default=2, ge=1, le=3)
+    # On shutdown: how long a child gets after SIGTERM before SIGKILL.
+    orchestrator_child_grace_seconds: float = 10.0
+    # After a child exits, how long its output reader may take to hit EOF.
+    orchestrator_drain_timeout_seconds: float = 10.0
+    # Child output is relayed line by line; longer lines are cut to this.
+    orchestrator_max_relayed_line_chars: int = 2_000
+
     @property
     def agent_model_context_headroom_tokens(self) -> int:
         """What the model's own window leaves for input after output and margin."""
@@ -165,6 +179,51 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    def frozen_execution_config(self) -> dict[str, Any]:
+        """The settings every attempt of one orchestration must share.
+
+        Persisted on the orchestration at creation; each child applies them with
+        `with_execution_config`, so a changed default or .env between the
+        coordinator starting and a child starting cannot make siblings run under
+        different budgets. Contains no credentials: the API key is deliberately
+        not a frozen field (it is a `SecretStr` and never persisted).
+        """
+        frozen: dict[str, Any] = {}
+        for name in type(self).model_fields:
+            if name in FROZEN_EXACT or name.startswith(FROZEN_PREFIXES):
+                frozen[name] = getattr(self, name)
+        return frozen
+
+    def with_execution_config(self, frozen: dict[str, Any]) -> "Settings":
+        """A copy of these settings with an orchestration's frozen values applied."""
+        allowed = {
+            name
+            for name in type(self).model_fields
+            if name in FROZEN_EXACT or name.startswith(FROZEN_PREFIXES)
+        }
+        unknown = set(frozen) - allowed
+        if unknown:
+            raise ValueError(f"Unexpected frozen settings: {sorted(unknown)}")
+        return self.model_copy(update=frozen)
+
+    def subprocess_environment(self, **overrides: str) -> dict[str, str]:
+        """The environment for an orchestrator's child process.
+
+        Inherited from this process (so credentials reach the child the same way
+        they reached us, never via argv), with explicit overrides — the database
+        URL, so a child always writes where its coordinator reads. Lives here
+        because this is the only module that reads the environment.
+        """
+        environment = dict(os.environ)
+        environment.update(overrides)
+        return environment
+
+
+# Frozen per orchestration: the model, and every agent, GitHub, and verification
+# budget. `anthropic_api_key` is excluded by construction (not in either set).
+FROZEN_EXACT = frozenset({"anthropic_model"})
+FROZEN_PREFIXES = ("agent_", "github_", "verify_")
 
 
 @lru_cache

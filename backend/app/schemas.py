@@ -15,16 +15,24 @@ from pydantic import (
 
 from app.models import (
     ATTEMPT_STATUS_FAILED,
+    ATTEMPT_STATUS_INTERRUPTED,
+    ATTEMPT_STATUS_QUEUED,
     ATTEMPT_STATUS_RUNNING,
     ATTEMPT_STATUS_SUCCEEDED,
     MAX_PARALLEL_ATTEMPTS,
     MIN_PARALLEL_ATTEMPTS,
+    ORCH_STATUS_COMPLETED,
+    ORCH_STATUS_FAILED,
+    ORCH_STATUS_INTERRUPTED,
+    ORCH_STATUS_QUEUED,
+    ORCH_STATUS_RUNNING,
     RUN_STATUS_FAILED,
     RUN_STATUS_INSPECTING,
     RUN_STATUS_PENDING,
     RUN_STATUS_READY,
     VERIFY_STATUS_COMPLETED,
     VERIFY_STATUS_FAILED,
+    VERIFY_STATUS_INTERRUPTED,
     VERIFY_STATUS_RUNNING,
 )
 from app.time_utils import to_iso_utc
@@ -205,11 +213,13 @@ class InspectionRead(BaseModel):
 
 
 class AttemptStatus(str, Enum):
-    """Patch-attempt states, independent of the run's own status."""
+    """Patch-attempt (proposal) states, independent of the run's own status."""
 
+    QUEUED = ATTEMPT_STATUS_QUEUED
     RUNNING = ATTEMPT_STATUS_RUNNING
     SUCCEEDED = ATTEMPT_STATUS_SUCCEEDED
     FAILED = ATTEMPT_STATUS_FAILED
+    INTERRUPTED = ATTEMPT_STATUS_INTERRUPTED
 
 
 class AttemptEventRead(BaseModel):
@@ -239,6 +249,10 @@ class PatchAttemptRead(BaseModel):
 
     id: str
     run_id: str
+    attempt_index: int
+    orchestration_id: str | None
+    emphasis_key: str | None
+    emphasis_text: str | None
     status: AttemptStatus
     model: str
     commit_sha: str | None
@@ -249,11 +263,14 @@ class PatchAttemptRead(BaseModel):
     output_tokens: int | None
     error_kind: str | None
     error_message: str | None
-    started_at: datetime
+    pipeline_error_kind: str | None
+    pipeline_error_message: str | None
+    started_at: datetime | None
     completed_at: datetime | None
 
     events: list[AttemptEventRead] = Field(default_factory=list)
     events_total: int = 0
+    verification: "VerificationRead | None" = None
 
     @field_serializer("started_at", "completed_at")
     def _serialize_timestamp(self, value: datetime | None) -> str | None:
@@ -269,6 +286,7 @@ class VerificationStatus(str, Enum):
     RUNNING = VERIFY_STATUS_RUNNING
     COMPLETED = VERIFY_STATUS_COMPLETED
     FAILED = VERIFY_STATUS_FAILED
+    INTERRUPTED = VERIFY_STATUS_INTERRUPTED
 
 
 class VerificationRead(BaseModel):
@@ -322,16 +340,66 @@ class VerificationRead(BaseModel):
         return to_iso_utc(value) if value is not None else None
 
 
+class OrchestrationStatus(str, Enum):
+    """Did the orchestration run to the end? Separate from what its attempts found."""
+
+    QUEUED = ORCH_STATUS_QUEUED
+    RUNNING = ORCH_STATUS_RUNNING
+    COMPLETED = ORCH_STATUS_COMPLETED
+    INTERRUPTED = ORCH_STATUS_INTERRUPTED
+    FAILED = ORCH_STATUS_FAILED
+
+
+class OrchestrationRead(BaseModel):
+    """A persisted orchestration and its comparison.
+
+    `comparison` is written once, at the end. `recommended_attempt_index` is NULL
+    whenever no attempt demonstrated a fix — the least-bad patch is never chosen.
+    `execution_config` is omitted: it is operational detail, not evidence.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    status: OrchestrationStatus
+    requested_attempts: int
+    concurrency_limit: int
+    effective_concurrency: int
+    model: str
+    commit_sha: str
+    profile: str
+    image_ref: str
+    image_id: str
+    recommended_attempt_index: int | None
+    comparison: dict[str, Any] | None = None
+    notes: list[str] | None = None
+    error_kind: str | None
+    error_message: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    @field_serializer("created_at", "started_at", "completed_at")
+    def _serialize_timestamp(self, value: datetime | None) -> str | None:
+        return to_iso_utc(value) if value is not None else None
+
+
 class RunDetailRead(RunRead):
-    """A run plus its inspection, patch attempt, and verification.
+    """A run plus its inspection, every attempt (each with its verification),
+    and the orchestration if there is one.
 
     The list endpoint deliberately returns `RunRead` without these — they would
-    make a list response unbounded.
+    make a list response unbounded. Legacy (manual) runs have one attempt and no
+    orchestration.
     """
 
     inspection: InspectionRead | None = None
-    patch_attempt: PatchAttemptRead | None = None
-    verification: VerificationRead | None = None
+    orchestration: OrchestrationRead | None = None
+    attempts: list[PatchAttemptRead] = Field(default_factory=list)
+
+
+PatchAttemptRead.model_rebuild()
 
 
 class HealthRead(BaseModel):

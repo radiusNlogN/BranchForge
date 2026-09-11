@@ -4,15 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project scope — read this first
 
-BranchForge will eventually investigate GitHub issues by running competing agent-generated fixes in
-isolated environments. **Milestones 1-4 exist: run intake, read-only repository inspection, one
-bounded patch-proposal agent, and containerised verification of the proposed patch.** A run is stored
-`pending`; `worker inspect` moves it to `ready`/`failed`; `worker propose` runs one agent that
-proposes a patch; `worker verify` applies that patch to a throwaway copy of the inspected commit and
-runs the repository's own tests before and after, in Docker.
+BranchForge investigates GitHub issues by running competing agent-generated fixes in isolated
+environments. **Milestones 1-5 exist: run intake, read-only repository inspection, bounded
+patch-proposal agents, containerised verification of each proposed patch, and bounded competing
+attempts with an evidence-based comparison.** A run is stored `pending`; `worker inspect` moves it to
+`ready`/`failed`; `worker orchestrate` reserves the run's `max_parallel_attempts` (1-3) slots, runs one
+child process per attempt (each a full propose → verify pipeline) under a per-process concurrency
+limit, and saves a comparison. The manual `worker propose` / `worker verify` path still works for a
+run with no orchestration.
 
 **`ready` means the inspection finished.** A patch attempt's `succeeded` means a diff was produced,
-not that it works.
+not that it works. **A recommendation means only that the attempt's own verification demonstrated a
+fix for its exact patch** — never "the best patch" — and when no attempt qualifies the answer is
+"No demonstrated fix" with no recommended attempt. Never promote the least-bad patch.
 
 **A verification result is NOT a correctness proof**, and the wording everywhere must keep that
 distinction. It reports how the tests that actually ran behaved, on one commit, in one runner
@@ -21,8 +25,10 @@ profile. There is deliberately no outcome value, badge, or copy that says "verif
 Deliberately absent — do not add these while working on unrelated tasks:
 repository dependency installation, running repository setup scripts or Dockerfiles, executing the
 model's `suggested_test_command`, non-Python runner profiles, applying patches to the user's
-checkout, competing parallel agents, context compaction, retries, crash recovery for stuck
-runs/attempts/verifications, scheduling or polling, authentication, deployment tooling.
+checkout, context compaction or context sharing between attempts, retries, durable crash recovery
+(for a killed orchestrator or stuck runs/attempts/verifications), a distributed scheduler or global
+capacity limit, scheduling or polling, an HTTP launch endpoint, SSE, authentication, deployment
+tooling.
 
 **Never add simulated agent activity or fabricated results** — no fake progress bars, spinners
 implying work that isn't happening, placeholder attempt rows, or invented patch output. Never
@@ -31,7 +37,8 @@ fabricate token counts or costs: `input_tokens`/`output_tokens` come from the pr
 in `frontend/src/components/NotImplementedNote.tsx`. When a milestone changes what is true, that text
 is a **correctness** change, not copy editing: milestone 2 falsified "does not contact GitHub", and
 milestone 3 falsified "does not call any AI model". Keep it, the README scope paragraph, and this
-section in sync.
+section in sync. Milestone 5 falsified "competing parallel attempts are not implemented" and the stale
+"milestone 1 · intake only" pill.
 
 ## Commands
 
@@ -57,7 +64,17 @@ uv run pytest -k "validator and reject"                                # by expr
 uv run python -m app.worker inspect --run-id <UUID>   # pending -> ready | failed
 uv run python -m app.worker propose --run-id <UUID>   # needs ANTHROPIC_API_KEY
 uv run python -m app.worker verify  --run-id <UUID>   # needs Docker + the runner image
+uv run python -m app.worker verify  --attempt-id <UUID>
+uv run python -m app.worker orchestrate --run-id <UUID>   # key + Docker + image
+
+# Local scripted benchmark (no model calls): concurrency 1 vs 3
+uv run python -m tests.orchestration_bench [--docker]
 ```
+
+`run-attempt --attempt-id --orchestration-id` also exists: it is what an orchestrator launches per
+attempt, hidden from `--help`. It is still callable by anyone, so it validates its arguments against
+the database (the attempt must belong to that orchestration, which must be active) and takes the
+workspace root, image ID, labels, and settings **from the orchestration row**, never from argv.
 
 The runner image must exist before `verify`. Build it from the repo root:
 
@@ -72,16 +89,23 @@ reports "No such image" for a tag `docker images` lists — which is why `resolv
 
 `inspect` exit codes: `0` ok, `1` failed (recorded on the run), `2` no such run, `3` not claimable.
 `propose` exit codes: `0` ok, `1` attempt failed (recorded on the attempt), `2` no such run, `3` the
-run already has an attempt, `4` the run is not `ready`, `5` model not configured (**no attempt row is
-created**).
+run already has an attempt (manual or orchestrated), `4` the run is not `ready`, `5` model not
+configured (**no attempt row is created**).
 
 `verify` exit codes: `0` the verification **ran** — whatever it found, including "the patch fixes
-nothing" — `1` the verification itself failed (recorded on the row), `2` no such run, `3` already
-verified, `4` no succeeded attempt with a diff and a commit SHA, `6` Docker unavailable (**no
-verification row is created**). Do not "fix" outcome-is-bad-news into a non-zero exit: the exit code
-reports whether the check ran, not what it concluded.
+nothing" — `1` the verification itself failed (recorded on the row), `2` no such run/attempt, `3`
+already verified, `4` no succeeded attempt with a diff and a commit SHA, `6` Docker unavailable (**no
+verification row is created**), `8` `--run-id` is ambiguous because the run has several attempts
+(prints a `--attempt-id` command per attempt). Do not "fix" outcome-is-bad-news into a non-zero exit:
+the exit code reports whether the check ran, not what it concluded.
 
-Each step happens at most once per run.
+`orchestrate` exit codes: `0` ran to completion — including "No demonstrated fix" — `1` the
+orchestration itself failed (coordinator error, or container cleanup that could not be confirmed;
+recorded), `2` no such run, `3` already orchestrated / claim lost, `4` not `ready`, `5` model not
+configured, `6` Docker or image unavailable, `7` the run has manual attempts, `130` interrupted
+(recorded). For `5`/`6`/`7` **nothing is reserved**. Same rule: the exit code says whether it ran.
+
+Each step happens at most once per run; `orchestrate` and `propose` are mutually exclusive per run.
 
 ```bash
 # Frontend setup, dev server → http://localhost:5173
@@ -105,7 +129,8 @@ uv run alembic current
 
 ### Test suite shape
 
-272 tests. All offline except the 15 marked `docker`, which build real containers.
+340 tests. All offline except the 17 marked `docker`, which build real containers (15 runner/verifier
+scenarios plus 2 real-container orchestrations in `tests/test_docker_orchestration.py`).
 
 ```bash
 uv run pytest -m "not docker"    # no daemon needed
@@ -123,6 +148,14 @@ Three mocking boundaries. Reuse them rather than inventing a fourth:
   takes anything with the `TestRunner` signature, so orchestration tests script one `RunResult` per
   workspace phase (`baseline` / `comparison` / `patched_full`). Snapshot acquisition is injected the
   same way, and `git apply` plus test-environment restoration stay **real** in those tests.
+
+Orchestration tests use **real child processes**, because a scripted model cannot cross a process
+boundary: `tests/orchestration_child.py` rebuilds the three mocks above from a JSON scenario and runs
+the real `worker.run_attempt_pipeline`; `tests/orchestration_driver.py` runs the real coordinator in
+its own process so real SIGTERM/SIGINT can be sent to it. Neither has a `test_` prefix, so neither is
+collected. Prove overlap with the scenario's file **barrier** and the flock-guarded active counter —
+never with elapsed-time thresholds. Orchestrator tests pass a fake `docker` shell script as
+`verify_docker_binary`, which records every sweep's `--filter` so label scoping can be asserted.
 
 `tests/test_docker_runner.py` marks itself `docker` and skips when the daemon or image is missing —
 **never** relax that into a fake pass. It is the only evidence the isolation flags take effect, and it
@@ -147,8 +180,8 @@ winners under it.
 
 ### Verifying without destroying the dev database
 
-Migration and restart checks must target a throwaway database. Never drop or downgrade
-`backend/branchforge.db` to test something:
+Migration and restart checks must target a throwaway database — a full SQLAlchemy URL, not a bare
+path. Never drop or downgrade `backend/branchforge.db` to test something:
 
 ```bash
 cd backend
@@ -157,6 +190,19 @@ uv run alembic upgrade head
 uv run alembic downgrade base
 unset DATABASE_URL
 ```
+
+### Table-rebuild migrations (0005 and anything like it)
+
+`0005` rebuilds `patch_attempts` via batch mode, whose `DROP` would cascade-delete child rows with
+foreign keys on. `alembic/env.py` therefore (for SQLite only, on the migration connection only) puts
+pysqlite in autocommit and emits `BEGIN` itself so DDL is genuinely transactional, turns foreign keys
+off before `BEGIN`, and turns them back on in `finally` — success or failure. A rebuilding migration
+must call `_require_foreign_keys_off()` before rebuilding and `PRAGMA foreign_key_check` before
+committing. Alembic runs each migration in its own transaction on SQLite, so a failure rolls back that
+migration only. Run table-rebuild migrations with the API and all workers stopped. **Test them against
+a populated database** (see `_seed_0004` in `tests/test_migrations.py`): every other test builds an
+empty one, which cannot notice lost child rows. The downgrade refuses, changing nothing, when the older
+shape cannot hold the data.
 
 ## Architecture
 
@@ -445,6 +491,54 @@ leave a claimed verification stranded — the same rule as checking model config
 an attempt. An unusable baseline short-circuits before the comparison container runs. No session is
 held open across a download or a container run.
 
+### Orchestration (milestone 5)
+
+`app/orchestrator.py` is an asyncio coordinator over **child processes**; `app/comparison.py` is pure
+(no DB, no Docker); the per-attempt pipeline is `worker.run_attempt_pipeline` reusing the unchanged
+agent and verifier. Invariants to preserve:
+
+- **One commit is the claim.** `claim_orchestration` inserts the orchestration (`run_id` UNIQUE) and
+  all N `queued` attempts together; UNIQUE `(run_id, attempt_index)` also makes it mutually exclusive
+  with a manual `propose` (always index 1). A child claims its slot with a conditional `UPDATE …
+  WHERE id=? AND orchestration_id=? AND status='queued'`.
+- **Preflight before reserving**: model configuration and Docker/image resolution happen first, so a
+  missing key or stopped daemon writes nothing.
+- **Frozen execution config.** `Settings.frozen_execution_config()` (model plus every `agent_*`,
+  `github_*`, `verify_*` field — never the API key) is stored on the orchestration with the resolved
+  **image ID** and workspace root; children apply it with `with_execution_config` and refuse to run if
+  their model differs. Do not let a child read these from its own environment.
+- **Child environment comes from `Settings.subprocess_environment`** (config.py stays the only module
+  reading `os.environ`); children get `start_new_session=True` so terminal Ctrl+C hits only the
+  coordinator, which then signals each child's **process group**.
+- **Children run with `cwd=backend/`**, so `orchestrate_run` absolutizes a relative SQLite
+  `DATABASE_URL` (`_absolute_sqlite_url`) against the coordinator's own launch directory before
+  reserving anything. Without it, a coordinator started outside `backend/` would hand its children a
+  URL that resolves to a different file. Tests never see this — they all use absolute temp paths.
+- **A slot is held until cleanup is confirmed**: child exited → its group SIGKILLed for stragglers →
+  output reader at EOF → DB reconciled → `remove_labelled_containers` for that attempt's label
+  confirmed by a second empty listing. Unconfirmed cleanup stops all further launches and fails the
+  orchestration (`cleanup_unconfirmed`) — never release the slot early or claim the bound still holds.
+- **Completion comes from the database, never the exit code.** `reconcile_attempt_pipeline` runs after
+  every child exit, exit 0 included: an unfinished proposal becomes `failed`/`interrupted`; a saved
+  patch with no verification row gets `pipeline_error_kind = verification_not_started` (the attempt
+  stays `succeeded`); a `running` verification becomes `failed`/`interrupted` plus
+  `verification_unfinished`. All writes are conditional so a just-written result is never overwritten.
+- **Container ownership is a label**, `branchforge.orchestration=<id>` / `branchforge.attempt=<id>`,
+  values validated as runner-owned hex/UUID in `runner._label_args`. Sweeps filter on exactly one
+  key=value and never touch other owners' or unlabelled containers. Cancelling an asyncio task does not
+  stop a subprocess, and killing `docker run` does not stop its container — the label sweep is the
+  guarantee.
+- **The output relay reads fixed chunks**, holds at most `ORCHESTRATOR_MAX_RELAYED_LINE_CHARS` of a
+  line, and keeps draining if forwarding fails.
+- **Eligibility re-checks evidence** (`comparison._reasons`): outcome `fix_demonstrated`, verification
+  `commit_sha`/`patch_sha256` equal to the candidate's commit and diff hash, same image ID and profile
+  as the orchestration, non-empty `fixed`, empty regression/missing/weakened lists, usable untruncated
+  summaries. Disagreeing baselines across eligible candidates ⇒ no recommendation. Supplemental
+  results are never read. Only `fix_demonstrated` qualifies — `partial_fix` never does.
+- An interrupted orchestration still saves a comparison, with `complete: false` and
+  `recommendation_scope: "completed_attempts_only"` — keep that distinction visible.
+- The concurrency limit is **per orchestrator process**; do not describe it as global.
+
 ## Frontend rules
 
 - **Never `dangerouslySetInnerHTML`, and no markdown-to-HTML library.** Repository text renders as
@@ -455,12 +549,19 @@ held open across a download or a container run.
 - The diff is model output: render it as plain text. `PatchAttemptPanel` classifies lines for colour
   by inspecting the first character and emitting React elements — never by generating HTML. Do not
   add a syntax-highlighting or markdown library here.
-- **"Unverified patch — not applied or tested" must stay adjacent to the diff**, not in a footer.
+- **A warning must stay adjacent to the diff**, not in a footer. With no verification it is exactly
+  "Unverified patch — not applied or tested"; once a verification exists that sentence would be false,
+  so it becomes "Model-generated patch — not proven correct" with the throwaway-copy explanation.
+- `OrchestrationPanel` keeps **proposal state and test evidence in separate columns**, shows "No
+  demonstrated fix" when nothing qualifies, prints the tie-breaker disclaimer beside any
+  recommendation, and labels an incomplete comparison "among completed attempts only". Orchestration
+  "completed" is deliberately not styled green.
 - The suggested test command is display-only. Do not add a run button or anything that reads as
   executable.
 - **`VerificationPanel` must never render a pass/fail badge.** The outcome is stated in words from
   `OUTCOME_LABELS`, and only `fix_demonstrated` / `partial_fix` are styled as good news. The word
-  "verified" does not appear in the panel, and an SSR check asserts that.
+  "verified" does not appear in the panel. (Earlier milestones mention an SSR check asserting this;
+  no such script exists in the repository — it was a historical, non-reproducible check.)
 - Container logs are untrusted program output: plain text in `<pre>`, inside `<details>`. No
   highlighting, no HTML.
 - The scope sentence next to the outcome (which commit, which profile, "not a proof of correctness")
@@ -504,18 +605,21 @@ would otherwise require JSON for a list-typed field.
 **`RUN_LIST_MAX_LIMIT` must stay ≥ 25**: the dashboard requests 25 runs per list call, so a lower
 ceiling makes every list request fail with a 422.
 
-## Three status enums, each spanning four places
+## Four status enums, each spanning four places
 
 All are **literal unions** in `frontend/src/types.ts`, so a new value arriving from the API against a
-stale type is a runtime mismatch `tsc` cannot catch. Update all four places together.
+stale type is a runtime mismatch `tsc` cannot catch. Update all four places together (badge classes
+live in `styles.css`; `LifecycleBadge` in `StatusBadge.tsx` renders the last three).
 
 | Enum | Values | Defined in | Mirrored in | Styled in |
 |---|---|---|---|---|
 | Run | `pending → inspecting → ready \| failed` | `models.py` `RUN_STATUS_*`, `schemas.py` `RunStatus` | `types.ts` `RunStatus` | `StatusBadge.tsx` |
-| Attempt | `running → succeeded \| failed` | `models.py` `ATTEMPT_STATUS_*`, `schemas.py` `AttemptStatus` | `types.ts` `AttemptStatus` | `PatchAttemptPanel.tsx` |
-| Verification | `running → completed \| failed` | `models.py` `VERIFY_STATUS_*`, `schemas.py` `VerificationStatus` | `types.ts` `VerificationStatus` | `VerificationPanel.tsx` |
+| Attempt | `queued → running → succeeded \| failed \| interrupted` | `models.py` `ATTEMPT_STATUS_*`, `schemas.py` `AttemptStatus` | `types.ts` `AttemptStatus` | `.badge--attempt-*` |
+| Verification | `running → completed \| failed \| interrupted` | `models.py` `VERIFY_STATUS_*`, `schemas.py` `VerificationStatus` | `types.ts` `VerificationStatus` | `.badge--verify-*` |
+| Orchestration | `queued → running → completed \| interrupted \| failed` | `models.py` `ORCH_STATUS_*`, `schemas.py` `OrchestrationStatus` | `types.ts` `OrchestrationStatus` | `.badge--orch-*` |
 
-All three are independent on purpose — see the note under Database schema.
+All four are independent on purpose — see the note under Database schema. Orchestration `failed` means
+the coordinator failed (or cleanup could not be confirmed), not that attempts failed.
 
 **A verification's `outcome` is a fourth vocabulary and is deliberately NOT an enum type.** It is a
 plain string column, defined once in `app/verification.py` as `OUTCOME_*` constants with
@@ -525,10 +629,12 @@ set into a boolean.
 
 ## Database schema
 
-Four migrations: `0001` (runs), `0002` (inspections), `0003` (`patch_attempts` + `attempt_events`),
-`0004` (`verifications`). Every child FK is `ON DELETE CASCADE`. Three columns are `UNIQUE`, and in each
-case the uniqueness **is** the claim mechanism rather than merely a constraint:
-`inspections.run_id`, `patch_attempts.run_id`, and `verifications.attempt_id`.
+Five migrations: `0001` (runs), `0002` (inspections), `0003` (`patch_attempts` + `attempt_events`),
+`0004` (`verifications`), `0005` (`orchestrations`; several attempts per run). Every child FK is
+`ON DELETE CASCADE`. Four uniqueness constraints **are** claim mechanisms rather than merely
+constraints: `inspections.run_id`, `orchestrations.run_id`, `patch_attempts (run_id, attempt_index)`,
+and `verifications.attempt_id`. `patch_attempts.run_id` is indexed but no longer unique;
+`patch_attempts.orchestration_id` is NULL for manual attempts.
 
 Note the parent differs: a verification hangs off the **patch attempt**, not the run, because it
 verifies a specific proposed patch. Deleting a run therefore cascades runs → attempts → verifications.
@@ -538,7 +644,9 @@ listener, so foreign keys are genuinely enforced for the API, the workers, and t
 `tests/test_migrations.py` asserts all of it, including that a verification cannot reference a missing
 attempt.
 
-**The three statuses are independent, and this is asserted.** `Run.status` describes inspection only;
+**The statuses are independent, and this is asserted.** `Run.status` describes inspection only;
 `PatchAttempt.status` describes whether a diff was produced. A run stays `ready` and an attempt stays
 `succeeded` however badly a verification turns out — **no verification code path may write `Run.status`
-or `PatchAttempt.status`.**
+or `PatchAttempt.status`.** Orchestrator reconciliation may write `PatchAttempt.status` only while the
+proposal itself is unfinished (`queued`/`running`); for a finished proposal it records
+`pipeline_error_*` instead.
