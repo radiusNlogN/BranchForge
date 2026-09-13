@@ -197,17 +197,33 @@ interface InspectionPanelProps {
   runId: string;
   status: RunStatus;
   inspection: Inspection | null;
+  /** `false` only when the backend says this deployment runs no dispatcher. */
+  dispatcherAvailable?: boolean | null;
 }
 
 /** Refresh lives once, in the run page header — not in each panel. */
-export function InspectionPanel({ runId, status, inspection }: InspectionPanelProps) {
+export function InspectionPanel({
+  runId,
+  status,
+  inspection,
+  dispatcherAvailable = null,
+}: InspectionPanelProps) {
   return (
     <section className="inspection">
       <div className="inspection__header">
         <h3>Repository inspection</h3>
       </div>
 
-      {status === "pending" ? (
+      {status === "pending" && dispatcherAvailable === false ? (
+        <div className="empty">
+          <p className="empty__title">Not inspected</p>
+          <p className="empty__text">
+            Nothing on this deployment inspects repositories, so this run stays uninspected here.
+          </p>
+        </div>
+      ) : null}
+
+      {status === "pending" && dispatcherAvailable !== false ? (
         <div className="empty">
           <p className="empty__title">Not inspected yet</p>
           <p className="empty__text">

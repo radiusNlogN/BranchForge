@@ -16,6 +16,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app import agent, repository, worker
+from app.config import settings
 from app.models import (
     JOB_STATUS_CANCELLED,
     JOB_STATUS_COMPLETED,
@@ -71,6 +72,30 @@ def test_starting_a_pending_run_queues_a_job(client) -> None:
     assert body["recovery_required"] is False
     # Accepted, not done: the run is untouched until a dispatcher picks it up.
     assert client.get(f"/api/runs/{run_id}").json()["status"] == "pending"
+
+
+def test_starting_is_refused_on_a_deployment_without_a_dispatcher(client, db, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "dispatcher_available", False)
+    run_id = make_run(client)
+    response = client.post(f"/api/runs/{run_id}/start")
+
+    assert response.status_code == 409
+    assert "no dispatcher" in response.json()["detail"]
+    # Refused means nothing was queued: no job exists to wait forever.
+    assert db.execute(text("SELECT COUNT(*) FROM execution_jobs")).scalar() == 0
+    assert client.get(f"/api/runs/{run_id}").json()["status"] == "pending"
+
+
+def test_an_existing_job_is_still_returned_without_a_dispatcher(client, monkeypatch) -> None:
+    """The existing-job return precedes the refusal, like it precedes eligibility."""
+    run_id = make_run(client)
+    first = client.post(f"/api/runs/{run_id}/start").json()
+
+    monkeypatch.setattr(settings, "dispatcher_available", False)
+    again = client.post(f"/api/runs/{run_id}/start")
+
+    assert again.status_code == 202
+    assert again.json()["id"] == first["id"]
 
 
 def test_starting_an_inspected_run_is_allowed(client, session_factory, worker_settings) -> None:

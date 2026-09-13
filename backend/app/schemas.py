@@ -524,3 +524,5 @@ class HealthRead(BaseModel):
     status: str
     service: str
     version: str
+    # Configuration, not a probe: whether this deployment runs a dispatcher at all.
+    dispatcher_available: bool

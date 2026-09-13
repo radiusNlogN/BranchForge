@@ -166,7 +166,7 @@ uv run alembic current
 
 ### Test suite shape
 
-389 tests pass today: 366 offline, the 17 marked `docker` (15 runner/verifier scenarios plus 2
+400 tests: 377 offline, the 17 marked `docker` (15 runner/verifier scenarios plus 2
 real-container orchestrations in `tests/test_docker_orchestration.py`), and the 6 marked `browser`,
 which drive a real Chromium through the dashboard.
 
@@ -715,7 +715,22 @@ workaround `orchestrate` uses. Invariants:
 `backend/.env.example` and `frontend/.env.example` document every variable; both are placeholder-only
 and tracked, while real `.env` files are gitignored.
 
-`DATABASE_URL` is the seam for moving off SQLite. `CORS_ORIGINS` is a comma-separated string parsed by
+`DATABASE_URL` is the seam for moving off SQLite. The API and migrations also run on Postgres through
+psycopg 3: `Settings` rewrites a plain `postgres://`/`postgresql://` URL to `postgresql+psycopg://`
+(SQLAlchemy rejects the first and maps the second to the uninstalled psycopg2), and
+`database._engine_kwargs` sets `prepare_threshold=None` because a transaction-mode pooler (Supabase,
+port 6543) can hand consecutive transactions different server connections. **Execution is still
+SQLite-only** — `dispatcher_lock_path` refuses any other database — so a Postgres deployment is
+view-only and must set `DISPATCHER_AVAILABLE=false`.
+
+`DISPATCHER_AVAILABLE` (default `true`) is configuration, never a probe. When `false`, `POST /start`
+answers 409 *after* returning any existing job (the same ordering rule as eligibility), `/api/health`
+reports it, and the dashboard hides Start, never polls, and replaces NotImplementedNote's "start the
+whole workflow from this page" paragraph — that sentence is false on such a deployment. `vercel.json`
+deploys exactly this shape (backend service entrypoint `app/main.py`; the frontend built with an empty
+`VITE_API_BASE_URL` so it calls `/api` on its own origin).
+
+`CORS_ORIGINS` is a comma-separated string parsed by
 `Settings.cors_origin_list` — it is stored as a string rather than a list because pydantic-settings
 would otherwise require JSON for a list-typed field.
 
@@ -760,6 +775,14 @@ carries none of 0005's rebuild hazard. Its **downgrade** does rebuild `patch_att
 column, so it keeps 0005's guards and refuses (changing nothing) while any job row exists.
 `tests/test_migrations.py` exercises 0005→0006 against a **populated** database via `_seed_0005`,
 because an empty one cannot notice lost child rows.
+
+**The rebuild is SQLite-only.** 0005's upgrade and 0006's downgrade pass `recreate="always"` only on
+SQLite and `"auto"` elsewhere. On Postgres a move-and-copy must drop `patch_attempts_pkey`, which
+`attempt_events` and `verifications` reference, so it fails outright; every change there is a native
+`ALTER`. Keep the SQLite branch byte-identical. The Postgres path was checked once, by hand, against a
+throwaway Postgres 17 container (all five claim indexes, seven cascading FKs, two CHECKs present at
+head) — no test in the suite exercises it, because tests must not need a daemon. 0005's *downgrade* is
+still SQLite-only (its unaliased subquery is invalid Postgres).
 
 Note the parent differs: a verification hangs off the **patch attempt**, not the run, because it
 verifies a specific proposed patch. Deleting a run therefore cascades runs → attempts → verifications.

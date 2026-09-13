@@ -1,4 +1,4 @@
-import { API_BASE_URL } from "../api";
+import { API_BASE_LABEL } from "../api";
 import type { FieldErrors } from "../api";
 import type { Run, RunCreateInput } from "../types";
 import { Callout } from "./Callout";
@@ -19,6 +19,7 @@ import { RunList } from "./RunList";
 
 interface Props {
   runs: Run[] | null;
+  dispatcherAvailable: boolean | null;
   listError: string | null;
   onReloadRuns: () => void;
   onOpenRun: (runId: string) => void;
@@ -32,6 +33,7 @@ interface Props {
 
 export function HomePage({
   runs,
+  dispatcherAvailable,
   listError,
   onReloadRuns,
   onOpenRun,
@@ -43,13 +45,13 @@ export function HomePage({
 }: Props) {
   return (
     <>
-      <NotImplementedNote />
+      <NotImplementedNote dispatcherAvailable={dispatcherAvailable} />
 
       {listError ? (
         <Callout tone="error" title="Could not load runs" onRetry={onReloadRuns}>
           <p>{listError}</p>
           <p className="muted">
-            API base URL: <code>{API_BASE_URL}</code>
+            API base URL: <code>{API_BASE_LABEL}</code>
           </p>
         </Callout>
       ) : null}

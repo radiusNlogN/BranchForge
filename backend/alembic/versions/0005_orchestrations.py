@@ -62,6 +62,10 @@ def _require_no_dangling_references() -> None:
         )
 
 
+def _recreate() -> str:
+    return "always" if op.get_bind().dialect.name == "sqlite" else "auto"
+
+
 def upgrade() -> None:
     _require_foreign_keys_off()
 
@@ -103,7 +107,10 @@ def upgrade() -> None:
     # The old unique index must go before the rebuild re-creates indexes.
     op.drop_index("ix_patch_attempts_run_id", table_name="patch_attempts")
 
-    with op.batch_alter_table("patch_attempts", recreate="always") as batch:
+    # The rebuild is a SQLite necessity. Elsewhere every change below is a native
+    # ALTER, and a move-and-copy would have to drop the primary key that
+    # attempt_events and verifications reference — Postgres refuses that.
+    with op.batch_alter_table("patch_attempts", recreate=_recreate()) as batch:
         batch.add_column(
             sa.Column("attempt_index", sa.Integer(), nullable=False, server_default="1")
         )
@@ -130,6 +137,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # SQLite-only, unlike the upgrade: the unaliased subquery below is invalid
+    # Postgres, and the rebuild further down still recreates unconditionally.
     bind = op.get_bind()
     orchestrations = bind.exec_driver_sql("SELECT COUNT(*) FROM orchestrations").scalar()
     multi = bind.exec_driver_sql(

@@ -252,6 +252,15 @@ export function dispatchCommand(): string {
   return "uv run python -m app.worker dispatch";
 }
 
+/** Mirrors the backend's `HealthRead`. */
+export interface Health {
+  status: string;
+  service: string;
+  version: string;
+  /** Configuration, not a probe: false means this deployment runs no dispatcher at all. */
+  dispatcher_available: boolean;
+}
+
 /** Mirrors the backend's lightweight progress schemas. */
 
 export interface VerificationProgress {

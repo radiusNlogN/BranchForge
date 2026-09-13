@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiError,
-  API_BASE_URL,
+  API_BASE_LABEL,
   cancelRun,
   createRun,
   fetchRun,
+  fetchHealth,
   fetchRunProgress,
   fetchRuns,
   startRun,
@@ -50,6 +51,11 @@ export default function App() {
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Whether this deployment runs a dispatcher at all. `null` until the health
+  // check answers, and it stays `null` if that fails — Start is then offered as
+  // before, and the backend's own refusal is what the user sees.
+  const [dispatcherAvailable, setDispatcherAvailable] = useState<boolean | null>(null);
+
   // Every asynchronous result is checked against these before it is allowed to
   // touch state. Responses do not arrive in the order they were sent, and the
   // user can navigate mid-flight, so a late answer about the previous run would
@@ -77,6 +83,20 @@ export default function App() {
   useEffect(() => {
     void loadRuns();
   }, [loadRuns]);
+
+  useEffect(() => {
+    let current = true;
+    fetchHealth()
+      .then((health) => {
+        if (current) setDispatcherAvailable(health.dispatcher_available);
+      })
+      .catch(() => {
+        // Unknown stays unknown; see the state's comment.
+      });
+    return () => {
+      current = false;
+    };
+  }, []);
 
   // The detail view always reads the run back from the backend, so what is shown
   // is the persisted record rather than anything held locally.
@@ -163,8 +183,10 @@ export default function App() {
 
   // Polling runs only while a job is queued or running. When it reaches a
   // terminal state this flips to false and the effect's cleanup clears the
-  // interval; navigating away or unmounting does the same.
-  const polling = hasActiveJob(progress, selectedRun);
+  // interval; navigating away or unmounting does the same. A deployment without a
+  // dispatcher never polls: nothing there can move a queued job, so every tick
+  // would be a wasted request that implies something might.
+  const polling = dispatcherAvailable !== false && hasActiveJob(progress, selectedRun);
 
   useEffect(() => {
     if (selectedId === null || !polling) return;
@@ -273,7 +295,11 @@ export default function App() {
               </p>
             </div>
           </a>
-          <span className="pill">milestone 6 · start from the dashboard</span>
+          <span className="pill">
+            {dispatcherAvailable === false
+              ? "milestone 6 · view-only deployment"
+              : "milestone 6 · start from the dashboard"}
+          </span>
         </div>
       </header>
 
@@ -287,6 +313,7 @@ export default function App() {
             error={detailError}
             justCreated={mergedRun !== null && mergedRun.id === createdId}
             polling={polling}
+            dispatcherAvailable={dispatcherAvailable}
             actionPending={actionPending}
             actionError={actionError}
             onStart={handleStart}
@@ -307,6 +334,7 @@ export default function App() {
         ) : (
           <HomePage
             runs={runs}
+            dispatcherAvailable={dispatcherAvailable}
             listError={listError}
             onReloadRuns={() => void loadRuns()}
             onOpenRun={openRun}
@@ -322,7 +350,7 @@ export default function App() {
       <footer className="footer">
         <span>BranchForge</span>
         <span className="muted">
-          API <code>{API_BASE_URL}</code>
+          API <code>{API_BASE_LABEL}</code>
         </span>
       </footer>
     </div>

@@ -215,6 +215,17 @@ def start_run(
     if existing is not None:
         return ExecutionJobRead.model_validate(existing)
 
+    # After the existing-job return, for the same reason as eligibility: a repeat
+    # Start must still get its own job back.
+    if not settings.dispatcher_available:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This deployment runs no dispatcher, so a started run would wait in the "
+                "queue forever. Runs can be created and viewed here, but not started."
+            ),
+        )
+
     refusal = _start_refusal(db, run)
     if refusal is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=refusal)
