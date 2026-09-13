@@ -15,3 +15,25 @@ export function StatusBadge({ status }: { status: RunStatus }) {
     </span>
   );
 }
+
+/**
+ * A lifecycle badge for an attempt, verification, orchestration, or execution
+ * job. It states whether something *ran*, never whether a patch is good —
+ * outcomes are words.
+ */
+export function LifecycleBadge({
+  family,
+  status,
+  label,
+}: {
+  family: "attempt" | "verify" | "orch" | "job";
+  status: string;
+  label?: string;
+}) {
+  return (
+    <span className={`badge badge--${family}-${status}`}>
+      <span className="badge__dot" aria-hidden="true" />
+      {label ?? status}
+    </span>
+  );
+}

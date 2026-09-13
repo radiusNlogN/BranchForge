@@ -1,5 +1,4 @@
 import type { ComparisonData, RunSummaryData, Verification } from "../types";
-import { verifyCommand } from "../types";
 import { formatAbsolute } from "../time";
 
 /**
@@ -15,8 +14,11 @@ import { formatAbsolute } from "../time";
  * `<pre>`, with no `dangerouslySetInnerHTML` and no highlighting library.
  */
 
-/** Wording for each outcome. Neutral phrasing; nothing here says "verified". */
-const OUTCOME_LABELS: Record<string, string> = {
+/**
+ * Wording for each outcome. Neutral phrasing; nothing here says "verified".
+ * Exported so the orchestration summary uses the same words.
+ */
+export const OUTCOME_LABELS: Record<string, string> = {
   fix_demonstrated: "Originally failing tests now pass",
   partial_fix: "Some originally failing tests now pass",
   still_failing: "Originally failing tests still fail",
@@ -164,39 +166,47 @@ function ComparisonDetail({ comparison }: { comparison: ComparisonData }) {
 }
 
 interface Props {
-  runId: string;
+  /** The exact command that verifies THIS attempt. */
+  command: string;
   hasAttempt: boolean;
+  /** An active orchestrator will verify this patch itself. */
+  pendingByOrchestrator: boolean;
   verification: Verification | null;
-  refreshing: boolean;
-  onRefresh: () => void;
 }
 
 export function VerificationPanel({
-  runId,
+  command,
   hasAttempt,
+  pendingByOrchestrator,
   verification,
-  refreshing,
-  onRefresh,
 }: Props) {
   if (!hasAttempt) {
     return null;
   }
 
+  // `.panel` / `.panel__head` were never defined in styles.css — this was the
+  // only component using them, so its header was not a flex row and the section
+  // had no card styling at all. Every sibling panel uses `.inspection`.
   if (verification === null) {
     return (
-      <section className="panel">
-        <h3>Verification</h3>
-        <p className="muted">
-          The proposed patch has not been applied or tested. To run the repository's own
-          test suite before and after the patch, in a container with no network:
-        </p>
-        <pre className="command">{verifyCommand(runId)}</pre>
-        <p className="muted small">
-          Requires Docker and the runner image. Refresh once it finishes.
-        </p>
-        <button type="button" onClick={onRefresh} disabled={refreshing}>
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
+      <section className="inspection">
+        <div className="inspection__header">
+          <h3>Verification</h3>
+        </div>
+        {pendingByOrchestrator ? (
+          <p className="muted">
+            The orchestrator verifies this patch as the next step of its pipeline.
+          </p>
+        ) : (
+          <>
+            <p className="muted">
+              The proposed patch has not been applied or tested. To run the repository's own
+              test suite before and after the patch, in a container with no network:
+            </p>
+            <pre className="command">{command}</pre>
+            <p className="muted small">Requires Docker and the runner image.</p>
+          </>
+        )}
       </section>
     );
   }
@@ -204,30 +214,37 @@ export function VerificationPanel({
   const tone = outcomeTone(verification.outcome);
 
   return (
-    <section className="panel">
-      <div className="panel__head">
+    <section className="inspection">
+      <div className="inspection__header">
         <h3>Verification</h3>
-        <span className={`badge badge--verify-${verification.status}`}>
-          {verification.status}
-        </span>
-        <button type="button" onClick={onRefresh} disabled={refreshing}>
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
+        <div className="inspection__actions">
+          <span className={`badge badge--verify-${verification.status}`}>
+            {verification.status}
+          </span>
+        </div>
       </div>
 
       {verification.status === "running" && (
-        <p className="muted">
-          Containers are running. Nothing polls automatically — use Refresh.
-        </p>
+        <p className="muted">Containers are running.</p>
       )}
 
       {verification.status === "failed" && (
         <div className="callout callout--error" role="alert">
-          <strong>The verification could not run.</strong>
+          <strong>The verification could not run to completion.</strong>
           <p>{verification.error_message}</p>
           {verification.error_kind !== null && (
             <p className="small muted">Reason: {verification.error_kind}</p>
           )}
+        </div>
+      )}
+
+      {verification.status === "interrupted" && (
+        <div className="callout callout--warn" role="note">
+          <strong>The verification was interrupted.</strong>
+          <p>{verification.error_message}</p>
+          <p className="small muted">
+            Its containers were removed. No result was recorded and none is implied.
+          </p>
         </div>
       )}
 
@@ -249,20 +266,38 @@ export function VerificationPanel({
         repository were installed.
       </p>
 
-      <h4>Patch application</h4>
-      <p className="small">
-        {verification.patch_applied ? "Applied cleanly." : "Did not apply."}{" "}
-        {verification.patch_apply_message}
-      </p>
-      {verification.files_changed !== null && verification.files_changed.length > 0 && (
-        <ul className="small">
-          {verification.files_changed.map((path) => (
-            <li key={path}>
-              <code>{path}</code>
-            </li>
-          ))}
-        </ul>
-      )}
+      {/*
+        The backend's own message is the single source of truth here, and the UI
+        adds no prefix to it.
+
+        A prefix used to be prepended — "Applied cleanly." / "Did not apply." —
+        which was wrong three ways. On success it duplicated the message it
+        introduced ("Applied cleanly. Applied cleanly to 3 file(s)."). On a
+        failed apply it was the third restatement of one fact, after the outcome
+        label and the message itself. And for "Not attempted: no original test
+        suite was found." it asserted something false: application was never
+        attempted, so it neither applied nor failed to.
+
+        Gated on `completed` because `patch_applied` is a non-nullable column
+        defaulting to false, and `patch_apply_message` is only ever written on
+        the completed path — so a running or failed verification rendered a bare,
+        unqualified "Did not apply." about a patch nothing had tried yet.
+      */}
+      {verification.status === "completed" && verification.patch_apply_message ? (
+        <>
+          <h4>Patch application</h4>
+          <p className="small">{verification.patch_apply_message}</p>
+          {verification.files_changed !== null && verification.files_changed.length > 0 && (
+            <ul className="small">
+              {verification.files_changed.map((path) => (
+                <li key={path}>
+                  <code>{path}</code>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      ) : null}
 
       {verification.patch_touched_tests && (
         <div className="callout callout--warn" role="note">

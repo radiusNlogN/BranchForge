@@ -6,7 +6,7 @@
  * `{loc, msg}` objects, while other errors carry `detail` as a plain string.
  */
 
-import type { Run, RunCreateInput, RunDetail } from "./types";
+import type { ExecutionJob, Run, RunCreateInput, RunDetail, RunProgress } from "./types";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000").replace(
   /\/+$/,
@@ -133,5 +133,33 @@ export function createRun(input: RunCreateInput): Promise<Run> {
   return request<Run>("/api/runs", {
     method: "POST",
     body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The small response a poll repeats. Deliberately a different endpoint from
+ * `fetchRun`: that one carries every diff, container log, and event, which would
+ * be megabytes to re-download every couple of seconds just to learn nothing
+ * changed.
+ */
+export function fetchRunProgress(runId: string): Promise<RunProgress> {
+  return request<RunProgress>(`/api/runs/${encodeURIComponent(runId)}/progress`);
+}
+
+/**
+ * Enqueue this run's workflow. Returns 202 with the job — including when a job
+ * already exists, so clicking Start twice is harmless. Duplicate prevention is
+ * enforced by the backend, not by the button's disabled state.
+ */
+export function startRun(runId: string): Promise<ExecutionJob> {
+  return request<ExecutionJob>(`/api/runs/${encodeURIComponent(runId)}/start`, {
+    method: "POST",
+  });
+}
+
+/** Request cancellation. Idempotent; a finished job comes back unchanged. */
+export function cancelRun(runId: string): Promise<ExecutionJob> {
+  return request<ExecutionJob>(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: "POST",
   });
 }

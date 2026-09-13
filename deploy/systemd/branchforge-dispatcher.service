@@ -1,0 +1,54 @@
+[Unit]
+Description=BranchForge execution-queue dispatcher (worker dispatch)
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=branchforge-dispatcher
+Group=branchforge
+WorkingDirectory=/opt/branchforge/backend
+EnvironmentFile=/etc/branchforge/dispatcher.env
+UMask=0002
+
+ExecStart=/usr/local/bin/uv run python -m app.worker dispatch
+
+Restart=on-failure
+RestartSec=10
+# recovery_required is a one-way flag: nothing in the codebase ever clears it
+# (only app.repository.mark_job_recovery_required sets it), and
+# startup_recovery_scan() re-blocks on every dispatcher startup as long as any
+# job row has it set. Auto-restarting after exit 10 would therefore not retry
+# anything — it would just repeat the same refusal forever. The service must
+# stay stopped so an operator notices and runs deploy/README.md's manual
+# recovery procedure before starting it again.
+RestartPreventExitStatus=10
+# A graceful SIGTERM shutdown (the dispatcher finishing up and stopping
+# cleanly) exits 130 by the app's own convention — that is a clean stop, not
+# a failure, and must not count against the restart-limit accounting above.
+SuccessExitStatus=130
+
+# Must exceed DISPATCHER_CHILD_GRACE_SECONDS (90s by default) plus reconcile
+# and container-sweep time, or systemd would SIGKILL the dispatcher mid
+# cleanup and defeat the confirmed-cleanup guarantee it relies on (stop the
+# processes, reconcile the database, sweep labelled containers, and only then
+# report the job stopped).
+TimeoutStopSec=180
+# Only the main process receives systemd's own SIGTERM; the dispatcher's own
+# signal handler then runs its documented single-SIGTERM shutdown sequence
+# for any child it spawned, rather than systemd's cgroup broadcast signalling
+# those children directly and racing that sequence.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Deliberately NOT sandboxed with PrivateTmp/ProtectSystem: this process
+# shells out to `docker run` with bind mounts under TMPDIR (see
+# dispatcher.env). dockerd resolves those bind-mount sources in the host's
+# real mount namespace, so giving this unit a private filesystem view would
+# produce spurious "no such file or directory" bind-mount failures that have
+# nothing to do with a real problem. NoNewPrivileges is safe here — it does
+# not affect the group-based access this account has to docker.sock.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

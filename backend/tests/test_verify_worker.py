@@ -259,7 +259,9 @@ def test_the_api_returns_the_persisted_verification(
     run_verify(run_id, session_factory, verify_settings)
 
     payload = client.get(f"/api/runs/{run_id}").json()
-    record = payload["verification"]
+    # The verification is nested under the attempt it verified.
+    record = payload["attempts"][0]["verification"]
+    assert record["attempt_id"] == payload["attempts"][0]["id"]
     assert record["status"] == "completed"
     assert record["outcome"] == "fix_demonstrated"
     assert record["comparison"]["fixed"] == [ADD]
@@ -268,7 +270,7 @@ def test_the_api_returns_the_persisted_verification(
 
     # The list endpoint stays lean.
     listed = client.get("/api/runs").json()
-    assert "verification" not in listed[0]
+    assert "verification" not in listed[0] and "attempts" not in listed[0]
 
 
 # --- Claiming ---------------------------------------------------------------

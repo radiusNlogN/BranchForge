@@ -1,0 +1,56 @@
+# BranchForge production Caddyfile.
+#
+# Before using this:
+#   1. Replace REPLACE_WITH_YOUR_DOMAIN below with the real DNS name for this
+#      deployment. Its A (and/or AAAA) record must already point at this
+#      host's public IP.
+#   2. Ports 80 and 443 must be reachable from the internet on this host —
+#      Caddy uses port 80 for the ACME HTTP-01 challenge and then serves
+#      everything over HTTPS on 443, redirecting plain HTTP automatically.
+#      Once both are true, Caddy obtains and renews a trusted certificate for
+#      the domain with no further action; nothing else in this file changes.
+#   3. Replace REPLACE_WITH_USERNAME and REPLACE_WITH_BCRYPT_HASH below.
+#      Generate the hash on this host with:
+#        caddy hash-password
+#      and paste only the resulting hash here — never a plaintext password.
+#
+# Until step 1-2 are done with a real domain, this file cannot obtain a
+# certificate and Caddy will fail to start it as written.
+
+REPLACE_WITH_YOUR_DOMAIN {
+	encode gzip
+
+	# Applies to every request below — the frontend and the API alike — before
+	# either handler runs. There is deliberately no path that skips this: the
+	# whole app is one authenticated demo, not a public site with a protected
+	# admin area.
+	basic_auth {
+		REPLACE_WITH_USERNAME REPLACE_WITH_BCRYPT_HASH
+	}
+
+	# The backend has no public hostname or port of its own (it binds
+	# 127.0.0.1:8000 only — see deploy/systemd/branchforge-api.service); this
+	# proxy is the only way to reach it. Matched first, so a request under
+	# /api/ always gets FastAPI's own JSON response — including its own 404
+	# for an unknown route — and never falls through to the static handler
+	# below.
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# Everything else is the built dashboard. The app uses a hash router
+	# (URLs look like /#/runs/<uuid>); the fragment after "#" never leaves the
+	# browser, so every request this server actually receives is for "/" or a
+	# real static asset — direct navigation and refresh on a run's URL already
+	# work with no rewrite rule. try_files below is ordinary static-site
+	# hygiene for any other literal path, not something the hash router needs.
+	handle {
+		root * /opt/branchforge/frontend/dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output file /var/log/caddy/branchforge-access.log
+	}
+}

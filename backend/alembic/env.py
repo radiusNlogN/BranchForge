@@ -9,7 +9,7 @@ import sys
 from logging.config import fileConfig
 from pathlib import Path
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, event, pool
 
 from alembic import context
 
@@ -51,6 +51,35 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _make_sqlite_ddl_transactional(connectable) -> None:
+    """Give SQLite migrations a real transaction, including for DDL.
+
+    pysqlite does not emit BEGIN before DDL, so without this a migration that
+    failed halfway through a table rebuild would leave the half it had done. The
+    standard SQLAlchemy recipe: put the driver in autocommit mode and emit BEGIN
+    ourselves. Registered on this engine only — the application's engine is
+    untouched.
+    """
+
+    @event.listens_for(connectable, "connect")
+    def _autocommit_driver(dbapi_connection, connection_record) -> None:  # noqa: ANN001
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(connectable, "begin")
+    def _emit_begin(conn) -> None:  # noqa: ANN001
+        conn.exec_driver_sql("BEGIN")
+
+
+def _set_sqlite_foreign_keys(connection, enabled: bool) -> None:
+    """Set the pragma directly on the driver connection, outside any transaction.
+
+    `PRAGMA foreign_keys` is a no-op inside a transaction, so it must be issued
+    before BEGIN (and after COMMIT/ROLLBACK) — hence the raw DBAPI connection.
+    """
+    raw = connection.connection.dbapi_connection
+    raw.execute(f"PRAGMA foreign_keys={'ON' if enabled else 'OFF'}")
+
+
 def run_migrations_online() -> None:
     section = config.get_section(config.config_ini_section, {}) or {}
     section["sqlalchemy.url"] = get_database_url()
@@ -60,17 +89,33 @@ def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+    is_sqlite = connectable.dialect.name == "sqlite"
+    if is_sqlite:
+        _make_sqlite_ddl_transactional(connectable)
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            # SQLite cannot ALTER most things in place; batch mode keeps future
-            # migrations workable.
-            render_as_batch=True,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+        # Table rebuilds (batch mode) DROP the original table; with foreign keys
+        # enforced that DROP cascades into child tables. They are disabled for this
+        # migration connection only, and restored in `finally` whether or not the
+        # migration succeeded. Migrations that rebuild tables check the pragma
+        # themselves and run `PRAGMA foreign_key_check` before committing.
+        if is_sqlite:
+            _set_sqlite_foreign_keys(connection, False)
+        try:
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                # SQLite cannot ALTER most things in place; batch mode keeps future
+                # migrations workable.
+                render_as_batch=True,
+            )
+            with context.begin_transaction():
+                context.run_migrations()
+        finally:
+            if is_sqlite:
+                if connection.in_transaction():
+                    connection.rollback()
+                _set_sqlite_foreign_keys(connection, True)
 
     connectable.dispose()
 

@@ -3,19 +3,32 @@
 BranchForge investigates GitHub issues by running competing agent-generated fixes in isolated
 environments and presenting verified patches.
 
-**This repository currently contains milestones 1-4: run intake, read-only repository inspection,
-one bounded patch-proposal agent, and containerised verification of the proposed patch.** A run is
-stored as `pending`; one worker command inspects the repository through the GitHub API
-(`ready`/`failed`); a second runs a single agent that proposes a patch; a third applies that patch to
-a throwaway copy of the exact inspected commit and runs the repository's own tests before and after,
-inside a container with no network access.
+**This repository currently contains milestones 1-6: run intake, read-only repository inspection,
+bounded patch-proposal agents, containerised verification of each proposed patch, bounded competing
+attempts with an evidence-based comparison, and a persistent execution queue started from the
+dashboard.** A run is stored as `pending`. Pressing **Start** (or `POST /api/runs/{id}/start`)
+enqueues one job and returns immediately — the API never does the work. A separate **dispatcher**
+process claims queued jobs one at a time and runs the existing steps as child processes: inspection
+through the GitHub API (skipped when the run is already `ready`), then `orchestrate`, which runs the
+run's `max_parallel_attempts` (1-3) competing attempts as separate processes, a bounded number at a
+time — each proposing a patch with its own agent and verifying it by applying it to a throwaway copy
+of the exact inspected commit and running the repository's own tests before and after, inside a
+container with no network access — and saves a comparison. The dashboard polls while a job is active.
+The `inspect`, `propose`, `verify`, and `orchestrate` commands still work and bypass the queue.
+
+**A queued job is not work in progress.** Nothing happens until a dispatcher is running, and the
+dashboard says so rather than implying activity.
 
 **A verification result is not a proof of correctness.** It reports how the tests that actually ran
 behaved, on one commit, in one fixed runner profile. Repository dependencies are never installed and
 no repository setup script is ever run, so a project needing more than the profile provides is
-reported as an *environment limitation* rather than as a failing patch. Competing parallel attempts,
-retries, and scheduling are not implemented, nothing is scheduled automatically, and no progress or
-results are simulated.
+reported as an *environment limitation* rather than as a failing patch. **A recommendation is not a
+judgement that a patch is right:** an attempt is recommended only when its own verification
+demonstrated previously failing original tests now passing with nothing regressed, missing, or
+truncated; otherwise the result is "No demonstrated fix" and nothing is recommended. Retries,
+restarting a cancelled or failed run, cron-style scheduling, durable crash recovery, and a global
+capacity limit are not implemented, and no progress or results are simulated — every state shown is
+one the database actually holds.
 
 ---
 
@@ -32,6 +45,7 @@ results are simulated.
 - [Model configuration and budgets](#model-configuration-and-budgets)
 - [Verification: the runner and what a result means](#verification-the-runner-and-what-a-result-means)
 - [Configuration](#configuration)
+- [Deployment](#deployment)
 - [Project layout](#project-layout)
 - [Design notes](#design-notes)
 - [Limitations](#limitations)
@@ -75,13 +89,54 @@ results are simulated.
 - The dashboard shows the baseline and patched results side by side, the patch-application status,
   which tests changed state, collapsible container logs, and the exact runner command — with the
   outcome stated in words rather than as a "verified" badge.
+- `orchestrate` runs competing attempts: it reserves every attempt slot for a run in one atomic
+  commit, then runs one child process per attempt — each a full propose → verify pipeline with its own
+  conversation, budgets, events, patch, workspaces, and containers — under an asyncio semaphore. All
+  attempts share the inspected commit, the report, the issue text, the model, and frozen budgets; they
+  differ only in a small, recorded *investigation emphasis*, which does not guarantee different fixes.
+- A failed attempt does not stop its siblings. If a child exits unexpectedly — even with exit code 0
+  — the orchestrator reads what was actually persisted and records an accurate failure for whatever
+  was left unfinished, including a saved patch whose verification never started.
+- Ctrl+C or SIGTERM stops launching work, terminates active children by process group, removes
+  exactly the containers carrying this orchestration's ownership label, and records interrupted
+  outcomes.
+- The saved comparison recommends at most one attempt, and only one whose evidence demonstrates a fix
+  for its exact patch on the inspected commit. Ties are broken by fewer changed lines, then attempt
+  number — a stated preference, not proof of better code.
+- **Start** in the dashboard enqueues the whole workflow and returns immediately; a separate
+  dispatcher process claims queued jobs one at a time and runs inspection and orchestration as child
+  processes. No per-run terminal commands are needed.
+- Repeated or concurrent Start requests return the **same** job — one per run, enforced by a unique
+  constraint rather than by the button's disabled state.
+- The detail pane updates itself while a job is active, polling a small endpoint that carries statuses
+  only; the full payload is re-fetched when something actually changes, and polling stops at a
+  terminal state. Manual Refresh still works.
+- **Cancel** stops a queued job outright, and an active one only once its processes have stopped and
+  its containers are confirmed removed. Work already recorded is preserved and still shown.
+- Only one dispatcher can run per database, enforced by an OS file lock — a second exits immediately
+  having claimed nothing.
+- After a dispatcher is killed outright, its in-flight job is flagged as needing manual recovery and
+  the queue stops rather than running new work beside containers nobody can account for.
 
 ## The workflow
 
-Four steps. Nothing is automatic — you run the worker yourself.
+With a dispatcher running, the whole workflow is two actions: create a run, press **Start**.
 
 ```bash
-# 1. Create a run (dashboard at http://localhost:5173, or the API directly)
+# 1. Start the dispatcher once, from backend/, and leave it running.
+#    (needs ANTHROPIC_API_KEY, Docker, and the runner image)
+cd backend
+uv run python -m app.worker dispatch
+
+# 2. Create a run in the dashboard at http://localhost:5173 and press Start.
+#    The detail pane then updates itself: inspecting -> proposing and verifying
+#    -> the comparison. No terminal commands per run.
+```
+
+The same thing over HTTP, if you prefer:
+
+```bash
+# Create
 curl -X POST http://localhost:8000/api/runs \
   -H 'Content-Type: application/json' \
   -d '{"repository_url":"https://github.com/pallets/itsdangerous",
@@ -89,22 +144,66 @@ curl -X POST http://localhost:8000/api/runs \
        "max_parallel_attempts":1}'
 # -> {"id":"64fbb850-...","status":"pending", ...}
 
-# 2. Inspect it with the worker, from backend/
-cd backend
-uv run python -m app.worker inspect --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
+# Start (202, immediately — this enqueues, it does not execute)
+curl -X POST http://localhost:8000/api/runs/64fbb850-.../start
 
-# 3. Propose a patch (needs ANTHROPIC_API_KEY)
-uv run python -m app.worker propose --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
+# Watch cheaply, or just watch the dashboard
+curl http://localhost:8000/api/runs/64fbb850-.../progress
 
-# 4. Verify it (needs Docker and the runner image — see below)
-uv run python -m app.worker verify --run-id 64fbb850-784e-44fa-8c73-9e0dce94c339
-
-# 5. Refresh the run's detail view in the dashboard (or GET /api/runs/<id>)
+# Change your mind
+curl -X POST http://localhost:8000/api/runs/64fbb850-.../cancel
 ```
 
-Each step happens at most once per run. `verify` exits `0` whenever the verification *ran* — including
-when its finding is "the patch does not fix anything". A non-zero exit means the verification itself
-could not be carried out.
+Every step can still be driven by hand, bypassing the queue entirely:
+
+```bash
+cd backend
+uv run python -m app.worker inspect     --run-id <UUID>
+uv run python -m app.worker orchestrate --run-id <UUID>   # competing attempts
+# ...or a single manual attempt instead
+uv run python -m app.worker propose --run-id <UUID>
+uv run python -m app.worker verify  --run-id <UUID>
+```
+
+A run can be started **once**. There is no restart: cancelling keeps everything already produced,
+but the run is then finished. Create a new run to try again.
+
+`dispatch` exit codes: `0` clean shutdown (Ctrl+C/SIGTERM — it stops claiming, winds down its
+current job, and leaves queued jobs for a later dispatcher), `5` the model is not configured, `6`
+Docker or the runner image is unavailable, `9` another dispatcher already holds the lock, `10` a job
+needs manual recovery (see [Limitations](#limitations)), `130` interrupted. For `5`, `6`, `9`, and
+`10` **nothing is claimed**.
+
+Cancellation is honest about timing. A *queued* job is cancelled immediately — it has no processes
+and no containers, so cancelling it needs neither a dispatcher nor Docker. A *running* job records
+the request and stays non-terminal until its children have actually stopped and its containers are
+confirmed removed; reporting "cancelled" while a container is still running would be a claim we
+cannot support. If the completion commits first, that result stands and the cancel returns it
+unchanged.
+
+Each step happens at most once per run. `orchestrate` and `propose` are mutually exclusive for a run:
+orchestration is refused (exit `7`) for a run that already has manual attempts, and `propose` is
+refused for a run that has been orchestrated. `verify --run-id` works when the run has exactly one
+attempt; with several it exits `8` and prints the `verify --attempt-id <UUID>` command for each.
+
+`verify` exits `0` whenever the verification *ran* — including when its finding is "the patch does not
+fix anything". A non-zero exit means the verification itself could not be carried out. `orchestrate`
+follows the same rule: `0` means it ran to the end, including when the answer is "No demonstrated
+fix".
+
+`orchestrate` exit codes: `0` ran to completion, `1` the orchestration itself failed (recorded — a
+coordinator error, or container cleanup that could not be confirmed), `2` no such run, `3` already
+orchestrated or claimed by another orchestrator, `4` the run is not `ready`, `5` the model is not
+configured, `6` Docker or the runner image is unavailable, `7` the run already has manual attempts,
+`130` interrupted by Ctrl+C or SIGTERM (recorded). For `5`, `6`, and `7` **nothing is reserved** —
+configuration and Docker are checked before any row is written.
+
+The number of attempts is the run's `max_parallel_attempts`. How many run *at once* is
+`min(ORCHESTRATOR_MAX_CONCURRENCY, max_parallel_attempts)` — a limit on **one orchestrator process**,
+not a global capacity limit: two orchestrators for two runs each get their own. A concurrency slot
+covers an attempt's whole propose → verify pipeline and is released only after the child has exited,
+its output has been drained, the database has been reconciled, and removal of its containers has been
+confirmed; if that confirmation fails, no further queued attempts are launched.
 
 Building the runner image once, before the first `verify`:
 
@@ -224,9 +323,10 @@ npm install                   # installs from package-lock.json
 
 ## Running locally
 
-Two processes, one per terminal.
+Three processes, one per terminal. The dispatcher is separate from the API on purpose: work that
+outlives an HTTP response must not live inside the web process.
 
-**Terminal 1 — backend** (from `backend/`):
+**Terminal 1 — API server** (from `backend/`):
 
 ```bash
 cd backend
@@ -236,7 +336,24 @@ uv run uvicorn app.main:app --reload --port 8000
 - API: <http://localhost:8000>
 - Interactive docs: <http://localhost:8000/docs>
 
-**Terminal 2 — frontend** (from `frontend/`):
+**Terminal 2 — dispatcher** (from `backend/`):
+
+```bash
+cd backend
+uv run python -m app.worker dispatch
+```
+
+- Drains the queue that **Start** writes to, one job at a time.
+- Needs `ANTHROPIC_API_KEY`, Docker, and the runner image. Both are checked at startup, before
+  anything is claimed, so a misconfiguration costs nothing.
+- **One dispatcher per database, on one host.** Exclusivity is an OS file lock (`flock`) on a file
+  beside the SQLite database; a second dispatcher exits `9` having done nothing. The lock path is
+  derived from the resolved database file, so two spellings of one database cannot yield two locks.
+  `flock` does not carry these semantics across networked filesystems — this is a single-host
+  arrangement.
+- Without it, runs simply sit at `queued`. That is the honest state, and the dashboard says so.
+
+**Terminal 3 — frontend** (from `frontend/`):
 
 ```bash
 cd frontend
@@ -326,6 +443,84 @@ The fixture repository under `backend/tests/sample_repo/` contains a deliberatel
 excluded from our own suite via `collect_ignore_glob` in `tests/conftest.py` — otherwise it would fail
 the run it is meant to support.
 
+### Orchestration tests
+
+```bash
+cd backend
+uv run pytest tests/test_comparison.py             # eligibility and recommendation (pure)
+uv run pytest tests/test_orchestration_claim.py    # claims, preflight, frozen settings, ambiguity
+uv run pytest tests/test_orchestrator.py           # REAL child processes, scripted proposals
+uv run pytest tests/test_docker_orchestration.py   # REAL containers under a real orchestrator
+```
+
+`test_orchestrator.py` launches genuine child processes (`tests/orchestration_child.py`, which runs the
+real `run-attempt` code path with the model, GitHub, snapshot, and — unless a scenario says otherwise —
+container runner scripted). Overlap is proven with a file **barrier** sized to the effective
+concurrency, which can only release if that many children are mid-proposal at the same moment; an
+flock-guarded counter records the peak number of live pipelines, which is asserted to equal the limit
+and never exceed it. No assertion depends on elapsed time. The suite also covers: duplicate
+orchestrators (barrier plus independent engines — the loser launches no child), a failed sibling, a
+child crashing mid-proposal, a child exiting with code `0` or `3` **between saving its patch and
+claiming its verification**, a child dying mid-verification, unconfirmed container cleanup stopping
+further launches, per-attempt isolation of events, diffs, emphasis, and workspaces, SIGTERM and SIGINT
+delivered to a real coordinator process (`tests/orchestration_driver.py`), and a child that ignores
+SIGTERM being killed after the grace period. `test_docker_orchestration.py` runs a real three-attempt
+orchestration, then interrupts one while two hanging patched runs sit inside real containers, and
+asserts that every container carrying its label is gone while decoy containers — one labelled for a
+different orchestration, one unlabelled — are still running.
+
+### Execution queue and dispatcher tests
+
+```bash
+cd backend
+uv run pytest tests/test_execution_jobs_api.py   # start/cancel contract, no execution
+uv run pytest tests/test_progress_api.py         # the poll payload stays small
+uv run pytest tests/test_dispatcher.py           # the dispatcher as a REAL process
+uv run pytest -m browser                         # Playwright (skips when unavailable)
+```
+
+`test_execution_jobs_api.py` covers repeated Start returning the same job (including *after* the job
+has started running and after it has completed), concurrent Starts from four independent engines
+released by a barrier producing exactly one row, every refusal (manual attempts, an existing
+orchestration, `inspecting`, `failed`, `ready`-without-a-commit), cancellation of queued, running,
+and completed jobs, and the cancel-versus-claim race — asserting that *either* cancellation prevents
+the launch *or* the claim wins and the job is left running for the dispatcher to notice, never both.
+
+`test_progress_api.py` has teeth rather than checking a schema: it builds a run with three attempts,
+60 KB diffs, 200 KB container logs and a full comparison, then asserts the detail payload exceeds a
+megabyte while the progress payload stays under 4 KB, and that no diff or log marker string appears
+anywhere in it.
+
+`test_dispatcher.py` runs the dispatcher as a genuine process (`tests/dispatcher_driver.py`) with
+only the model, image resolver, and child commands injected. It covers a second dispatcher exiting
+without doing work, the lock being released on exit, a pending run being inspected before it is
+orchestrated, a `ready` run skipping inspection, a failed inspection preventing any model call,
+cancellation before launch and during work, cancellation *during inspection* being recorded honestly
+rather than leaving a run `inspecting`, shutdown leaving untouched queued jobs `queued`, a failed job
+not blocking the next, a job left `running` by a dead dispatcher being flagged and never replayed
+(with notes that do not duplicate across restarts), and unconfirmed cleanup stopping further work.
+
+The case that matters most: **an attempt child that survives a force-killed orchestrator.** Attempt
+children lead their own sessions, so signalling the coordinator's process group cannot reach them. A
+test makes the child ignore SIGTERM so the dispatcher must kill the orchestrator outright, then
+asserts the orphan is stopped and reaped before the container sweep — because otherwise it could
+still call the model and start containers after the job had been reported stopped.
+
+### Local scripted benchmark
+
+`uv run python -m tests.orchestration_bench [--docker]` runs the same three-attempt workload at
+concurrency 1 and 3. Proposals are scripted, so **no model is called**; this measures process
+management and verification only, on one machine and one toy fixture. Recorded here on an Apple M1
+Pro (10 cores; Docker Desktop VM with 10 CPUs), three runs each:
+
+| Verification | Concurrency 1 | Concurrency 3 |
+|---|---|---|
+| scripted runner | 3.3s, 3.3s, 3.5s (median 3.3s) | 1.4s, 1.3s, 2.0s (median 1.4s) |
+| real Docker containers | 7.3s, 5.8s, 6.4s (median 6.4s) | 2.3s, 2.4s, 2.2s (median 2.3s) |
+
+**This is not a claim about real-model speedups.** A real orchestration is dominated by model latency,
+provider rate limits, and cost, none of which this benchmark exercises.
+
 ### Live verification check (optional — uses your GitHub rate limit, no API credit)
 
 Verification needs no model call: a deterministic patch is better evidence than a generated one. To
@@ -381,12 +576,29 @@ cd backend
 export DATABASE_URL="sqlite:///$(mktemp -d)/check.db"
 
 uv run alembic upgrade head
-uv run alembic current            # -> 0001 (head)
+uv run alembic current            # -> 0006 (head)
 uv run alembic downgrade base     # exercises downgrade()
 uv run alembic upgrade head
 
 unset DATABASE_URL
 ```
+
+**Migration `0006` only adds** — `CREATE TABLE execution_jobs` plus
+`ALTER TABLE patch_attempts ADD COLUMN worker_pid` — both of which SQLite performs in place, so the
+cascade hazard below does not arise on the way up. Its *downgrade* does rebuild `patch_attempts` (a
+column cannot be dropped in place), so it carries the same guards, and it **refuses to downgrade at
+all while any execution job exists**: revision 0005 has nowhere to put those rows, and deleting them
+to make the downgrade succeed would destroy the record of what was started or cancelled.
+
+**Migration `0005` rebuilds the `patch_attempts` table** (SQLite cannot relax its old unique index or
+`NOT NULL` in place). Run it with the API and every worker stopped. `alembic/env.py` disables SQLite
+foreign keys on the migration connection only — otherwise the rebuild's `DROP` would cascade-delete
+attempt events and verifications — makes the DDL genuinely transactional, and restores the pragma in a
+`finally` block whether or not the migration succeeds. The migration refuses to run if foreign keys
+are still on, and runs `PRAGMA foreign_key_check` before committing, so a dangling reference rolls it
+back to `0004`. Existing attempts become `attempt_index = 1` with their events and verifications
+intact (`tests/test_migrations.py` checks this against a populated `0004` database). Downgrading below
+`0005` is refused, changing nothing, while any orchestration or multi-attempt run exists.
 
 ### Restart persistence
 
@@ -420,15 +632,43 @@ Base path `/api`. Interactive documentation is at `/docs` while the backend is r
 | `POST` | `/api/runs` | Create a run. `201` with the persisted record. |
 | `GET` | `/api/runs?limit=` | List runs, newest first. `limit` is 1–100, default 25. |
 | `GET` | `/api/runs/{run_id}` | Fetch one run **plus its inspection**. `404` if unknown. |
+| `GET` | `/api/runs/{run_id}/progress` | Lightweight state for polling: scalars only. `404` if unknown. |
+| `POST` | `/api/runs/{run_id}/start` | Enqueue the workflow. `202` with the job; `409` if the run cannot be started. |
+| `POST` | `/api/runs/{run_id}/cancel` | Request cancellation. `202` with the job; `404` if never started. |
 
-`GET /api/runs/{run_id}` returns the run with nested `inspection` and `patch_attempt` objects, each
-`null` until the corresponding worker command has run. The list endpoint deliberately omits both —
-including them would make a list response unbounded. The detail response stays bounded because the
-workers' budgets bound what they write, and the attempt's event list is capped as well
+`POST /start` writes **one row** and returns. It never inspects, calls a model, starts a process, or
+uses a BackgroundTask — work that outlives the response would die with the API process. Repeated
+starts return the **existing** job rather than a second one or an error, so a double-clicked button
+is harmless; two concurrent requests collapse onto one job because `execution_jobs.run_id` is
+`UNIQUE` and the INSERT *is* the claim.
+
+`GET /progress` exists so polling is cheap. It carries the run's status, the job, the orchestration's
+status, and one row per attempt (status, pipeline error, event **count**, verification status and
+outcome) — and deliberately no diffs, logs, events, inspection report, or comparison. For a run with
+three attempts the detail payload is measured in megabytes; this stays a few hundred bytes. The
+dashboard fetches the full detail only when a status actually changes.
+
+`GET /api/runs/{run_id}` returns the run with a nested `inspection` (or `null`), an `attempts` list
+ordered by `attempt_index` — each attempt carrying its own nested `verification` (or `null`) — and an
+`orchestration` object (or `null` for a manual run). The list endpoint deliberately omits all of them:
+including them would make a list response unbounded. The detail response stays bounded: at most three
+attempts, the workers' budgets bound what they write, and each attempt's event list is capped
 (`events_total` reports how many exist).
 
-A run's own `status` reflects **inspection only**: it stays `ready` whether a patch attempt succeeds
-or fails. Attempt state lives on `patch_attempt.status` (`running`, `succeeded`, `failed`).
+Four lifecycles are kept separate on purpose:
+
+- A run's `status` reflects **inspection only**: it stays `ready` however its attempts turn out.
+- An attempt's `status` reflects **the proposal only**: `queued` (a reserved slot), `running`,
+  `succeeded` (a diff was produced — not that it works), `failed`, `interrupted`. If an orchestrated
+  pipeline stopped before its verification finished, `pipeline_error_kind` / `pipeline_error_message`
+  say so without changing the proposal's status.
+- A verification's `status` reflects whether it ran (`running`, `completed`, `failed`,
+  `interrupted`); its `outcome` says what it found.
+- An orchestration's `status` (`queued`, `running`, `completed`, `interrupted`, `failed`) reflects
+  whether it ran to the end. Its `comparison` holds each attempt's eligibility and the reasons, the
+  `headline` ("No demonstrated fix" when nothing qualifies), and `recommended_attempt_index` (`null`
+  unless an attempt demonstrated a fix). `complete: false` marks a comparison over only the attempts
+  that finished, and its recommendation is then labelled "among completed attempts only".
 
 ### Creating a run
 
@@ -733,9 +973,32 @@ edit them; neither contains secrets.
 | `GITHUB_MAX_TOTAL_CONTENT_BYTES` | `400000` | Cap across all previews combined |
 | `GITHUB_MAX_FILES_LISTED` | `500` | File-listing size in the report (display only) |
 | `GITHUB_MAX_FILES_FETCHED` | `8` | How many files to preview |
-| `ANTHROPIC_API_KEY` | *(unset)* | Required by `worker propose`. Never commit a real key |
+| `ANTHROPIC_API_KEY` | *(unset)* | Required by `propose` and `orchestrate`. Never commit a real key |
 | `ANTHROPIC_MODEL` | `claude-opus-5` | A model your account can access |
 | `AGENT_*` | see above | Agent budgets — [Model configuration and budgets](#model-configuration-and-budgets) |
+| `VERIFY_*` | see `.env.example` | Runner image, container ceilings, output bounds |
+| `ORCHESTRATOR_MAX_CONCURRENCY` | `2` | Attempt pipelines one orchestrator runs at once (1-3); per process, not global |
+| `ORCHESTRATOR_CHILD_GRACE_SECONDS` | `10.0` | On Ctrl+C/SIGTERM, time a child gets before SIGKILL |
+| `ORCHESTRATOR_DRAIN_TIMEOUT_SECONDS` | `10.0` | How long a finished child's output reader may take to reach EOF |
+| `ORCHESTRATOR_MAX_RELAYED_LINE_CHARS` | `2000` | Longest child output line relayed; the rest is discarded |
+| `DISPATCHER_POLL_SECONDS` | `2.0` | How often the dispatcher checks an empty queue |
+| `DISPATCHER_CANCEL_POLL_SECONDS` | `0.5` | How often an active job's cancellation flag is re-read |
+| `DISPATCHER_CHILD_GRACE_SECONDS` | `90.0` | Time a child gets after SIGTERM before SIGKILL |
+| `DISPATCHER_DRAIN_TIMEOUT_SECONDS` | `10.0` | How long a finished child's output reader may take to reach EOF |
+| `DISPATCHER_WORKER_GRACE_SECONDS` | `10.0` | Time an orphaned attempt worker gets before SIGKILL |
+| `DISPATCHER_MAX_JOB_NOTES` | `20` | Cap on operator notes kept on one job |
+
+`DISPATCHER_CHILD_GRACE_SECONDS` is large deliberately. On SIGTERM an orchestrator spends up to
+`ORCHESTRATOR_CHILD_GRACE_SECONDS` + `ORCHESTRATOR_DRAIN_TIMEOUT_SECONDS` +
+`VERIFY_CLEANUP_TIMEOUT_SECONDS` saving its comparison and sweeping its own containers. Killing it
+sooner throws that work away and leaves containers for the dispatcher to clean up, so keep this
+comfortably above their sum. There is deliberately **no** lock-path setting: the dispatcher's lock is
+derived from the resolved database file, because an override is exactly what would let one database
+have two locks.
+
+An orchestration **freezes** `ANTHROPIC_MODEL` and every `AGENT_*`, `GITHUB_*`, and `VERIFY_*` value
+when it starts (never the API key), together with the resolved runner image ID. Its children use
+those stored values, so editing `.env` mid-orchestration cannot make siblings run differently.
 
 The dashboard requests 25 runs per list call, so keep `RUN_LIST_MAX_LIMIT` at 25 or above —
 lowering it below that makes every list request fail validation with a 422.
@@ -748,6 +1011,16 @@ lowering it below that makes every list request fail validation with a 422.
 
 If you change the frontend's port or host, add its origin to `CORS_ORIGINS`.
 
+## Deployment
+
+`deploy/` documents one supported way to run this on a single Ubuntu LTS host: Caddy serves the
+built frontend and reverse-proxies `/api/*` to FastAPI, HTTPS and a shared password come from Caddy,
+and FastAPI and the dispatcher run as separate systemd services with only the dispatcher's account
+given Docker access. See `deploy/README.md` for exact install, upgrade, rollback, and
+recovery-required commands. It changes nothing about the agent, verification, cancellation, or
+comparison behavior described elsewhere in this file — only how the existing processes are launched
+and reached.
+
 ## Project layout
 
 ```
@@ -756,11 +1029,16 @@ backend/
     main.py          FastAPI app factory; CORS wired from configuration
     config.py        Pydantic-settings; the only reader of the environment
     database.py      Engine, session factory, declarative Base, get_db dependency
-    models.py        SQLAlchemy Run model
+    models.py        SQLAlchemy models: Run, Inspection, Orchestration, PatchAttempt, ...
     schemas.py       Request/response schemas; UTC timestamp serialization
     validators.py    GitHub repository URL validation and normalization
     repository.py    All database queries — no FastAPI imports
-    worker.py        Worker CLI (inspect, propose, verify); owns transaction boundaries
+    worker.py        Worker CLI (inspect, propose, verify, orchestrate, hidden run-attempt);
+                     owns transaction boundaries
+    orchestrator.py  Asyncio coordinator: child processes, semaphore, reconciliation, shutdown
+    dispatcher.py    The execution queue's dispatcher: OS lock, claim, stages, cancellation,
+                     orphan reaping, container sweep — reuses the commands above unchanged
+    comparison.py    Pure cross-attempt eligibility and recommendation
     github_client.py Bounded read-only GitHub client; typed errors
     inspection.py    File selection, pytest heuristic, report building
     model_client.py  The model boundary: ModelTurn, protocol, Anthropic adapter
@@ -776,7 +1054,9 @@ backend/
   alembic/
     env.py           Resolves the URL from DATABASE_URL
     versions/        0001_create_runs_table.py, 0002_create_inspections_table.py,
-                     0003_create_patch_attempts.py, 0004_create_verifications.py
+                     0003_create_patch_attempts.py, 0004_create_verifications.py,
+                     0005_orchestrations.py (rebuilds patch_attempts — see Migration),
+                     0006_execution_jobs.py (adds only; the downgrade rebuilds)
   runner/
     python-pytest/   The ONLY environment repository code runs in
       Dockerfile     python:3.11-slim + pinned pytest; nothing else
@@ -788,7 +1068,16 @@ backend/
     test_agent.py (scripted model), test_attempt_claim.py (contention + leakage),
     test_snapshot.py (extraction hardening), test_runner_argv.py (isolation flags),
     test_verification.py (comparison logic), test_verify_worker.py (worker + claim),
-    test_docker_runner.py (REAL containers; skips without Docker)
+    test_docker_runner.py (REAL containers; skips without Docker),
+    test_comparison.py, test_orchestration_claim.py, test_orchestrator.py (real child
+    processes), test_docker_orchestration.py (REAL containers under an orchestrator),
+    test_execution_jobs_api.py (start/cancel contract), test_progress_api.py (the
+    poll payload stays small), test_dispatcher.py (the dispatcher as a real process),
+    test_browser_dashboard.py (Playwright; skips when unavailable)
+    orchestration_child.py / orchestration_driver.py   Test-only child and coordinator
+                         processes (not collected); orchestration_bench.py  benchmark
+    dispatcher_driver.py / dispatcher_inspect_child.py  Test-only dispatcher and inspect
+                         children (not collected)
     fixture_support.py   Scenario patches, generated with difflib
     sample_repo/         Fixture repository with a known bug (not collected)
 
@@ -797,7 +1086,7 @@ frontend/src/
   api.ts             Fetch wrapper; normalizes 422 and 404 error shapes
   types.ts           Types mirroring the backend schemas
   time.ts            Absolute and relative timestamp formatting
-  components/        NewRunForm, RunList, RunDetail, InspectionPanel,
+  components/        NewRunForm, RunList, RunDetail, InspectionPanel, OrchestrationPanel,
                      PatchAttemptPanel, VerificationPanel, StatusBadge, Callout,
                      NotImplementedNote
   styles.css         Theme and layout (light and dark)
@@ -850,10 +1139,11 @@ Choices made now so a worker process can be added next without rework:
   multi-provider framework — there is one adapter.
 - **The controller loop is hand-written, not the SDK's tool runner**, because this milestone requires
   the Python side to validate and dispatch every tool call, enforce budgets, and cache reads.
-- **An attempt is claimed by inserting its row.** `patch_attempts.run_id` is `UNIQUE`, so the INSERT
-  *is* the atomic claim: the loser of a race catches `IntegrityError` and exits having made zero
-  model calls and zero GitHub requests. One mechanism satisfies both "atomic claim" and "one attempt
-  per run, enforced in the database".
+- **A manual attempt is claimed by inserting its row.** `(run_id, attempt_index)` is `UNIQUE` and a
+  manual attempt is always index 1, so the INSERT *is* the atomic claim: the loser of a race catches
+  `IntegrityError` and exits having made zero model calls and zero GitHub requests. An orchestration
+  reserves indices 1..N in the same commit as its own row (`orchestrations.run_id` is `UNIQUE`), so a
+  manual attempt and an orchestration contend for index 1 and cannot both win.
 - **Attempt status is separate from run status.** A run stays `ready` — meaning inspection
   succeeded — through a successful *and* a failed attempt. None of the attempt persistence functions
   touch `Run.status`.
@@ -864,7 +1154,8 @@ Choices made now so a worker process can be added next without rework:
   schema guarantees argument shape, never that a diff is well formed or its paths safe;
   `app/patch_validation.py` checks hunk line counts, rejects absolute and `..` paths, and refuses
   binary patches, renames, and copies. Passing validation does **not** mean the patch applies or
-  works — nothing runs `git apply`.
+  works — that is the verification step's job, which revalidates the diff before `git apply` touches a
+  throwaway copy.
 
 - **A tarball, not a clone.** An extracted source archive has no `.git` directory, so hooks,
   clean/smudge filters, submodule setup, and repository-supplied git config cannot exist by
@@ -881,7 +1172,31 @@ Choices made now so a worker process can be added next without rework:
   and started no container.
 - **Docker and the image are checked before the claim**, so a stopped daemon cannot leave a claimed
   verification stranded — the same ordering rule as checking model configuration before claiming an
-  attempt.
+  attempt. `orchestrate` applies the same rule before reserving any slot.
+
+- **Child processes, not threads or tasks, run attempts.** Each attempt reuses the synchronous agent
+  and Docker code unchanged inside its own process; the coordinator is asyncio only for waiting.
+  Children start in their own session, so terminal Ctrl+C reaches only the coordinator, which then
+  signals each child's whole process group.
+- **Cancelling a task stops nothing; killing `docker run` does not stop its container.** So every
+  container carries `branchforge.orchestration=<id>` and `branchforge.attempt=<id>` labels (validated
+  runner-owned UUIDs, never repository text), and cleanup is a label-scoped `docker rm -f` whose
+  success is confirmed by listing again. Other owners' and unlabelled containers are never touched.
+- **A slot is released only after cleanup is confirmed**, so a new pipeline cannot start while an
+  orphaned container from the last one still runs. Unconfirmed cleanup stops further launches and is
+  recorded as an orchestration failure rather than silently weakening the bound.
+- **Completion is read from the database, never inferred from an exit code.** After every child exit
+  the coordinator reconciles what was persisted: an unfinished proposal is failed or interrupted, a
+  saved patch whose verification never started keeps its `succeeded` proposal status but gains a
+  pipeline error, and a verification left `running` is failed or interrupted. Every write is
+  conditional, so a result stored just before the exit is never overwritten.
+- **Child arguments are checked, not trusted.** The hidden `run-attempt` command takes only IDs; it
+  verifies the attempt belongs to that active orchestration before claiming it, and reads the
+  workspace root, image ID, labels, and frozen settings from the orchestration row.
+- **Recommendation evidence must belong to the candidate.** Beyond `fix_demonstrated`, the
+  verification's commit SHA and patch hash must equal the attempt's commit and diff, its image ID and
+  profile must match the orchestration's, and eligible candidates' baselines must agree; otherwise no
+  cross-attempt recommendation is made.
 
 ## Limitations
 
@@ -898,10 +1213,25 @@ Choices made now so a worker process can be added next without rework:
 - **Local container isolation, not a multi-tenant security boundary.** No network, non-root,
   no capabilities, read-only root, and resource ceilings — but a container escape is still an escape.
   Do not point this at repositories you have reason to distrust.
-- **One verification per patch attempt, and no retries.** Abrupt interruption can leave a verification
-  `running` forever; recovery is not implemented. Create a new run.
-- **One attempt per run, and one agent, not competing attempts.** `max_parallel_attempts` is stored
-  and still unused; parallel agents and result comparison come later.
+- **One verification per patch attempt, and no retries.** A manual `verify` or `propose` killed
+  abruptly leaves its row `running` forever; recovery is not implemented. Create a new run.
+- **An orchestrator reconciles its children, but nothing reconciles the orchestrator.** If the
+  `orchestrate` process itself is killed with SIGKILL (or the machine crashes), its orchestration and
+  unfinished attempts stay `running`/`queued`, and labelled containers may outlive it — find them with
+  `docker ps --filter label=branchforge.orchestration=<id>`. Durable recovery is out of scope.
+- **The concurrency limit is per orchestrator process, not global.** Two orchestrators for two runs
+  each run up to their own limit. There is no scheduler or shared capacity pool.
+- **Competing attempts are not guaranteed to differ.** They share the issue, report, commit, model,
+  and budgets, and differ only in a short recorded investigation emphasis. There is no context sharing
+  between attempts.
+- **The comparison is conservative by design.** Only `fix_demonstrated` evidence tied to the exact
+  patch and commit is eligible; `partial_fix` is shown but never recommended. The tie-breaker (fewer
+  changed lines, then attempt number) is a preference, not evidence of better code. The saved
+  comparison is not recomputed if someone later runs a manual `verify --attempt-id`.
+- **No SSE.** The dashboard polls a lightweight endpoint every 2s while a job is active and stops at
+  a terminal state; manual Refresh remains. Streaming updates are out of scope.
+- **A queued job needs a dispatcher.** There is a queue, but no cron-style scheduling and no
+  supervisor that starts a dispatcher for you. If none is running, jobs wait indefinitely.
 - **No context compaction.** If the conversation would exceed the input budget the attempt stops with
   an explanation rather than dropping history.
 - **The patch is never applied to your checkout.** It is applied only inside runner-owned temporary
@@ -910,10 +1240,24 @@ Choices made now so a worker process can be added next without rework:
   GitHub API; verification extracts a source archive and executes it only inside a container.
   Repository content is treated as untrusted data everywhere: stored as text, displayed as plain text,
   never evaluated or followed as instructions.
-- **Nothing is scheduled.** You run each worker command yourself and refresh the page. There is no
-  queue, poller, or background scheduler.
-- **An interrupted worker leaves a run stuck in `inspecting`.** Nothing resets it and it cannot be
-  claimed again. Durable recovery (a lease with a timeout, or a reset command) is out of scope.
+- **A run can be started once, and never restarted.** `execution_jobs.run_id` is `UNIQUE` and retries
+  are not implemented, so a cancelled or failed run is finished. Everything it produced is kept and
+  still shown; create a new run to try again.
+- **Cancelling during inspection fails the run.** The inspector installs no SIGTERM handler, so it
+  dies mid-flight; the dispatcher then records the run as `failed` with a reason rather than leaving
+  it looking as though something is still inspecting it. Inspection is not resumable.
+- **A killed dispatcher stops the queue until a person intervenes.** Holding the lock proves no
+  dispatcher is alive; it proves nothing about the processes and containers the dead one started. So
+  a job found `running` at startup is **not** replayed and **not** declared stopped — either would be
+  a claim we cannot support. It is flagged `recovery_required`, annotated once (repeated restarts do
+  not duplicate the note), shown as such in the dashboard, and the dispatcher refuses to launch
+  further work, exiting `10`. **Manual recovery:** check for survivors with
+  `docker ps --filter label=branchforge.orchestration=<id>` and `ps -ef | grep run-attempt`, remove or
+  kill what you find, then decide what the job's row should say. Durable automatic recovery from an
+  abrupt crash is out of scope.
+- **A worker killed outside the queue still leaves a run stuck in `inspecting`.** The dispatcher
+  reconciles the children *it* started; a hand-run `inspect` killed abruptly is not reconciled by
+  anything.
 - **One inspection per run.** Only a `pending` run can be claimed, so a run cannot be re-inspected,
   including after a failure. Create a new run instead.
 - **The Python/pytest assessment is a heuristic** based on filenames and configuration text. A project
@@ -922,12 +1266,28 @@ Choices made now so a worker process can be added next without rework:
 - **Unauthenticated GitHub access only**, so roughly 5 inspections per hour and public repositories
   only — see [GitHub rate limits](#github-rate-limits). The source archive download does not count
   against the REST allowance.
-- **No authentication or authorization.** Every caller sees every run. Do not expose this beyond
-  localhost.
-- **SQLite and single-process only.** No connection pooling for concurrent writers, no Postgres
-  configuration, no deployment tooling. `DATABASE_URL` is the seam where that changes.
+- **No in-app authentication or authorization.** The FastAPI app itself has no login, sessions, or
+  per-user access control — every caller who reaches it sees every run and can act as every other
+  caller. `deploy/` documents putting a single shared password (HTTP Basic Auth, in Caddy) in front
+  of the whole app for a small trusted group; that is a reverse-proxy gate, not application accounts
+  or multi-tenancy. Without such a gate in front of it, do not expose this beyond localhost.
+- **SQLite, with a handful of local writers.** An orchestrator and its children are several processes
+  writing short transactions to one SQLite file, relying on SQLite's busy timeout (30s); that is
+  adequate for three attempts on one machine and not a design for many concurrent orchestrations. No
+  Postgres configuration — `DATABASE_URL` is the seam where that changes. `deploy/` documents one
+  supported way to run this on a single Ubuntu host (systemd units plus a Caddy reverse proxy); it
+  does not change the SQLite/single-writer-process model described above.
 - **The run list is a single bounded page** — no pagination cursors, filtering, or search.
-- **No automated frontend tests.** The frontend is covered by type checking, a production build, and a
-  server-side render check that asserts hostile strings are escaped.
-- **The dashboard UI has not been verified in a browser.** Click handlers, Refresh, and `<details>`
-  expansion are covered only by the type checker and the render check; see the milestone reports.
+- **Frontend coverage is type checking, a production build, and a Playwright tier.**
+  `tests/test_browser_dashboard.py` drives the real stack — real API, production frontend build, real
+  dispatcher — through Start, duplicate clicks, self-updating progress, polling stopping at a terminal
+  state, switching runs mid-poll, and a failed Start surfacing in the page. All six pass against a
+  real Chromium. It is marked `browser` and **skips cleanly** when Playwright is absent, exactly as
+  the `docker` tier does; it is never faked into passing — with Playwright missing pytest exits `5`
+  ("no tests ran"), which is a skipped tier and not a pass. `playwright==1.60.0` is a dev dependency
+  (pinned to match the cached chromium-1223 build). There are still no component-level unit tests,
+  and these tests assert against copy written alongside the components, so they check that the flow
+  works rather than independently pinning the wording.
+  Earlier milestone reports describe a server-side render check that asserted hostile strings are
+  escaped and that "verified" never appears; that script is **not in this repository**, so it remains a
+  historical, non-reproducible check.

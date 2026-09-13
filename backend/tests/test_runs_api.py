@@ -345,7 +345,8 @@ def test_run_detail_has_null_attempt_before_proposing(
     body = client.get(f"/api/runs/{run_id}").json()
     assert body["status"] == "ready"
     assert body["inspection"] is not None
-    assert body["patch_attempt"] is None
+    assert body["attempts"] == []
+    assert body["orchestration"] is None
 
 
 def test_run_detail_returns_the_persisted_patch_and_events(
@@ -371,9 +372,15 @@ def test_run_detail_returns_the_persisted_patch_and_events(
     # The run itself is untouched: `ready` still means inspection succeeded.
     assert body["status"] == "ready"
 
-    attempt = body["patch_attempt"]
+    assert len(body["attempts"]) == 1
+    attempt = body["attempts"][0]
     assert attempt["status"] == "succeeded"
     assert attempt["run_id"] == run_id
+    # A manual attempt: index 1, no orchestration, no emphasis.
+    assert attempt["attempt_index"] == 1
+    assert attempt["orchestration_id"] is None and attempt["emphasis_key"] is None
+    assert attempt["verification"] is None
+    assert body["orchestration"] is None
     assert attempt["model"] == "scripted-model-1"
     assert attempt["diff"] == VALID_DIFF
     assert attempt["summary"].startswith("Guard against")
@@ -399,9 +406,10 @@ def test_failed_attempt_is_visible_and_run_stays_ready(
 
     body = client.get(f"/api/runs/{run_id}").json()
     assert body["status"] == "ready"
-    assert body["patch_attempt"]["status"] == "failed"
-    assert body["patch_attempt"]["error_kind"] == "finished_without_patch"
-    assert body["patch_attempt"]["diff"] is None
+    attempt = body["attempts"][0]
+    assert attempt["status"] == "failed"
+    assert attempt["error_kind"] == "finished_without_patch"
+    assert attempt["diff"] is None
 
 
 def test_list_endpoint_excludes_patch_attempts(
@@ -415,5 +423,6 @@ def test_list_endpoint_excludes_patch_attempts(
 
     listed = client.get("/api/runs").json()
     assert listed[0]["id"] == run_id
-    assert "patch_attempt" not in listed[0]
+    assert "attempts" not in listed[0]
+    assert "orchestration" not in listed[0]
     assert "inspection" not in listed[0]

@@ -149,8 +149,43 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def build_initial_prompt(issue: str, report: InspectionReport) -> str:
-    """The first user message: the issue plus what the inspection already found."""
+# Competing attempts differ in exactly one recorded way: a short investigation
+# emphasis appended to the first message. The issue, the inspection report, the
+# system prompt, and the tools are identical across siblings. This nudges where an
+# attempt starts looking; it does NOT guarantee the attempts reach different fixes.
+INVESTIGATION_EMPHASES: list[tuple[str, str]] = [
+    (
+        "trace_origin",
+        "Before editing, trace the reported behaviour back to the function where it "
+        "originates, and prefer fixing it there rather than where the symptom shows.",
+    ),
+    (
+        "tests_first",
+        "Start from the existing tests closest to the reported behaviour and let them "
+        "guide which source files you read.",
+    ),
+    (
+        "smallest_diff",
+        "Favour the smallest diff that could plausibly resolve the issue; avoid "
+        "changing more than one function if you can.",
+    ),
+]
+
+
+def emphasis_for(attempt_index: int) -> tuple[str, str]:
+    """The emphasis for a 1-based attempt index."""
+    return INVESTIGATION_EMPHASES[(attempt_index - 1) % len(INVESTIGATION_EMPHASES)]
+
+
+def build_initial_prompt(
+    issue: str, report: InspectionReport, emphasis: str | None = None
+) -> str:
+    """The first user message: the issue plus what the inspection already found.
+
+    With `emphasis=None` (manual `propose`) the text is exactly what milestone 3
+    sent. An emphasis is appended *after* everything else, so siblings share an
+    identical issue and report and differ only in that final section.
+    """
     lines: list[str] = []
     repo = report.repository
     lines.append("## Issue to fix")
@@ -204,7 +239,15 @@ def build_initial_prompt(issue: str, report: InspectionReport) -> str:
         "Request any further files you need with `read_file`, then call "
         "`submit_patch` once with your proposed fix."
     )
+    if emphasis is not None:
+        lines.append("")
+        lines.append(EMPHASIS_HEADING)
+        lines.append("")
+        lines.append(emphasis)
     return "\n".join(lines)
+
+
+EMPHASIS_HEADING = "## Investigation emphasis for this attempt"
 
 
 def _seed_cache(budget: _Budget, report: InspectionReport) -> None:
@@ -367,6 +410,7 @@ def run_agent(
     commit_sha: str,
     config: Settings,
     record: EventSink,
+    emphasis: str | None = None,
 ) -> AgentResult:
     """Run one bounded attempt. Returns a patch or raises AgentFailure."""
     ref = parse_repository_url(repository_url)
@@ -380,7 +424,7 @@ def run_agent(
         )
 
     messages: list[dict[str, Any]] = [
-        {"role": "user", "content": build_initial_prompt(issue_description, report)}
+        {"role": "user", "content": build_initial_prompt(issue_description, report, emphasis)}
     ]
 
     while True:

@@ -107,8 +107,11 @@ export interface Inspection {
   error_message: string | null;
 }
 
-/** Patch-attempt state, independent of the run's own status. */
-export type AttemptStatus = "running" | "succeeded" | "failed";
+/**
+ * Patch-attempt (proposal) state, independent of the run's own status and of
+ * verification. `queued` is a slot an orchestrator reserved but has not started.
+ */
+export type AttemptStatus = "queued" | "running" | "succeeded" | "failed" | "interrupted";
 
 export interface AttemptEvent {
   seq: number;
@@ -119,12 +122,17 @@ export interface AttemptEvent {
 }
 
 /**
- * One agent attempt. `diff` is an UNVERIFIED proposal — it was never applied and
- * no tests were run.
+ * One agent attempt. `diff` is a proposal; whether it improved any test is only
+ * ever stated by its `verification`.
  */
 export interface PatchAttempt {
   id: string;
   run_id: string;
+  attempt_index: number;
+  /** `null` for a manual (`propose`) attempt. */
+  orchestration_id: string | null;
+  emphasis_key: string | null;
+  emphasis_text: string | null;
   status: AttemptStatus;
   model: string;
   commit_sha: string | null;
@@ -135,17 +143,162 @@ export interface PatchAttempt {
   output_tokens: number | null;
   error_kind: string | null;
   error_message: string | null;
-  started_at: string;
+  /** Set when an orchestrated pipeline stopped before its verification finished. */
+  pipeline_error_kind: string | null;
+  pipeline_error_message: string | null;
+  /** `null` while queued. */
+  started_at: string | null;
   completed_at: string | null;
   events: AttemptEvent[];
   events_total: number;
+  verification: Verification | null;
 }
 
-/** The run detail endpoint returns the run plus its inspection and attempt. */
+/** Did the orchestration run to the end? Separate from what its attempts found. */
+export type OrchestrationStatus = "queued" | "running" | "completed" | "interrupted" | "failed";
+
+export interface ComparisonCandidate {
+  attempt_index: number;
+  attempt_id: string;
+  eligible: boolean;
+  reasons: string[];
+  changed_lines: number | null;
+  outcome: string | null;
+}
+
+export interface OrchestrationComparison {
+  rule: string;
+  tie_breaker: string;
+  complete: boolean;
+  recommendation_scope: "all_attempts" | "completed_attempts_only" | null;
+  baselines_consistent: boolean | null;
+  recommended_attempt_index: number | null;
+  recommended_attempt_id: string | null;
+  headline: string;
+  candidates: ComparisonCandidate[];
+  notes: string[];
+}
+
+export interface Orchestration {
+  id: string;
+  run_id: string;
+  status: OrchestrationStatus;
+  requested_attempts: number;
+  concurrency_limit: number;
+  effective_concurrency: number;
+  model: string;
+  commit_sha: string;
+  profile: string;
+  image_ref: string;
+  image_id: string;
+  recommended_attempt_index: number | null;
+  /** Written once, when the orchestration ends. */
+  comparison: OrchestrationComparison | null;
+  notes: string[] | null;
+  error_kind: string | null;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/**
+ * Did the dispatcher carry this run's workflow through? Independent of every
+ * other status: a cancelled job leaves the inspection, patches, and test results
+ * it already produced exactly as they were recorded.
+ *
+ * `cancelled` is a person's decision; `interrupted` is the dispatcher shutting
+ * down. They are separate because those are different facts.
+ */
+export type ExecutionJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface ExecutionJob {
+  id: string;
+  run_id: string;
+  status: ExecutionJobStatus;
+  /** Which child is running now: "inspecting" | "orchestrating". Detail, not status. */
+  stage: string | null;
+  /** A request, not a state — an active job stays non-terminal until cleanup is confirmed. */
+  cancel_requested: boolean;
+  /** Found running with no dispatcher: its processes and containers may still be alive. */
+  recovery_required: boolean;
+  notes: string[] | null;
+  error_kind: string | null;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/** A job nobody is going to advance any further. */
+export function isJobTerminal(job: ExecutionJob | null): boolean {
+  if (job === null) return true;
+  return (
+    job.status === "completed" ||
+    job.status === "failed" ||
+    job.status === "cancelled" ||
+    job.status === "interrupted"
+  );
+}
+
+/** Shown so the user can copy the command that actually drains the queue. */
+export function dispatchCommand(): string {
+  return "uv run python -m app.worker dispatch";
+}
+
+/** Mirrors the backend's lightweight progress schemas. */
+
+export interface VerificationProgress {
+  status: VerificationStatus;
+  outcome: string | null;
+}
+
+export interface AttemptProgress {
+  attempt_index: number;
+  status: AttemptStatus;
+  error_kind: string | null;
+  pipeline_error_kind: string | null;
+  events_total: number;
+  started_at: string | null;
+  completed_at: string | null;
+  verification: VerificationProgress | null;
+}
+
+export interface OrchestrationProgress {
+  status: OrchestrationStatus;
+  recommended_attempt_index: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/**
+ * The poll response. Carries scalars only — no diffs, logs, events, reports, or
+ * comparison — so repeating it every couple of seconds stays cheap. Full
+ * artifacts come from the detail endpoint when something actually changes.
+ */
+export interface RunProgress {
+  id: string;
+  status: RunStatus;
+  updated_at: string;
+  job: ExecutionJob | null;
+  orchestration: OrchestrationProgress | null;
+  attempts: AttemptProgress[];
+}
+
+/** The run detail endpoint returns the run plus its inspection, attempts, and orchestration. */
 export interface RunDetail extends Run {
   inspection: Inspection | null;
-  patch_attempt: PatchAttempt | null;
-  verification: Verification | null;
+  orchestration: Orchestration | null;
+  /** `null` until the run has been started. */
+  job: ExecutionJob | null;
+  /** Ordered by attempt_index. One element for a manual run. */
+  attempts: PatchAttempt[];
 }
 
 export const MAX_ISSUE_DESCRIPTION_LENGTH = 10_000;
@@ -160,8 +313,12 @@ export function proposeCommand(runId: string): string {
   return `uv run python -m app.worker propose --run-id ${runId}`;
 }
 
+export function orchestrateCommand(runId: string): string {
+  return `uv run python -m app.worker orchestrate --run-id ${runId}`;
+}
+
 /** Did the verification run? Separate from what it found. */
-export type VerificationStatus = "running" | "completed" | "failed";
+export type VerificationStatus = "running" | "completed" | "failed" | "interrupted";
 
 /** One classified container run. */
 export interface RunSummaryData {
@@ -225,6 +382,12 @@ export interface Verification {
   completed_at: string | null;
 }
 
+/** For a run with exactly one attempt. */
 export function verifyCommand(runId: string): string {
   return `uv run python -m app.worker verify --run-id ${runId}`;
+}
+
+/** Unambiguous for any run: names the attempt. */
+export function verifyAttemptCommand(attemptId: string): string {
+  return `uv run python -m app.worker verify --attempt-id ${attemptId}`;
 }
