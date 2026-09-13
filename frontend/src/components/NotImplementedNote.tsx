@@ -12,30 +12,53 @@
  * and "queued" means a separate dispatcher process still has to pick the job up,
  * not that anything is happening yet. Do not compress any of them into
  * "verified", "best", or a progress bar.
+ *
+ * A deployment configured without a dispatcher (DISPATCHER_AVAILABLE=false)
+ * cannot start anything, so there "start the whole workflow from this page"
+ * would be false. That paragraph is replaced, not merely appended to.
  */
-export function NotImplementedNote({ compact = false }: { compact?: boolean }) {
+export function NotImplementedNote({
+  compact = false,
+  dispatcherAvailable = null,
+}: {
+  compact?: boolean;
+  dispatcherAvailable?: boolean | null;
+}) {
+  const noDispatcher = dispatcherAvailable === false;
+
   if (compact) {
     return (
       <p className="note note--compact">
-        Inspection is read-only. Proposed patches can be applied and tested in containers — that
-        shows how the existing tests behave, not that a patch is correct.
+        {noDispatcher
+          ? "This deployment runs no dispatcher: runs can be created and viewed, but not started. Where a dispatcher runs, proposed patches are tested in containers"
+          : "Inspection is read-only. Proposed patches can be applied and tested in containers"}{" "}
+        — that shows how the existing tests behave, not that a patch is correct.
       </p>
     );
   }
 
   return (
     <div className="note">
-      <p>
-        <strong>Milestone 6: start the whole workflow from this page.</strong> Creating a run stores
-        it as <code>pending</code>. <strong>Start</strong> adds it to a queue and returns
-        immediately — a separate <code>dispatch</code> process does the work, so a queued job sits
-        still until one is running. That process inspects the repository through the GitHub API,
-        then runs the requested number of attempts (1-3) as separate processes, a bounded number at
-        a time: each proposes a patch with its own agent and applies it to a throwaway copy of the
-        exact inspected commit, running the repository&apos;s own tests before and after in a
-        container with no network. The single-attempt <code>propose</code>/<code>verify</code>{" "}
-        commands still work.
-      </p>
+      {noDispatcher ? (
+        <p>
+          <strong>This deployment runs no dispatcher.</strong> Runs can be created and viewed here,
+          but not started: nothing on this host inspects repositories, calls an AI model, or runs
+          tests, so <strong>Start</strong> is turned off rather than queueing work that would never
+          move. The rest of this note describes what BranchForge does where a dispatcher runs.
+        </p>
+      ) : (
+        <p>
+          <strong>Milestone 6: start the whole workflow from this page.</strong> Creating a run
+          stores it as <code>pending</code>. <strong>Start</strong> adds it to a queue and returns
+          immediately — a separate <code>dispatch</code> process does the work, so a queued job
+          sits still until one is running. That process inspects the repository through the GitHub
+          API, then runs the requested number of attempts (1-3) as separate processes, a bounded
+          number at a time: each proposes a patch with its own agent and applies it to a throwaway
+          copy of the exact inspected commit, running the repository&apos;s own tests before and
+          after in a container with no network. The single-attempt{" "}
+          <code>propose</code>/<code>verify</code> commands still work.
+        </p>
+      )}
       <p>
         <strong>A verification result is not a correctness proof.</strong> It reports how the tests
         that actually ran behaved, on one commit, in one fixed runner profile. Repository

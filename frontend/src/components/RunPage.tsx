@@ -35,6 +35,8 @@ interface Props {
   error: string | null;
   justCreated: boolean;
   polling: boolean;
+  /** `false` only when the backend says this deployment runs no dispatcher. */
+  dispatcherAvailable: boolean | null;
   actionPending: boolean;
   actionError: string | null;
   onStart: (runId: string) => void;
@@ -52,6 +54,7 @@ export function RunPage({
   error,
   justCreated,
   polling,
+  dispatcherAvailable,
   actionPending,
   actionError,
   onStart,
@@ -122,7 +125,7 @@ export function RunPage({
         </div>
 
         <div className="runPage__actions">
-          {run !== null && canStart(run) ? (
+          {run !== null && canStart(run) && dispatcherAvailable !== false ? (
             <button
               type="button"
               className="button button--primary"
@@ -219,11 +222,12 @@ export function RunPage({
             </Callout>
           ) : null}
 
-          <NotImplementedNote compact />
+          <NotImplementedNote compact dispatcherAvailable={dispatcherAvailable} />
 
           <RunBody
             run={run}
             polling={polling}
+            dispatcherAvailable={dispatcherAvailable}
             attemptSlot={
               attempts.length > 0 && activeAttempt !== null ? (
                 <section className="inspection">

@@ -9,7 +9,7 @@ import os
 from functools import lru_cache
 from typing import Any
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
@@ -24,6 +24,20 @@ class Settings(BaseSettings):
     )
 
     database_url: str = "sqlite:///./branchforge.db"
+
+    @field_validator("database_url")
+    @classmethod
+    def _use_psycopg_driver(cls, value: str) -> str:
+        """Point a hosted provider's plain Postgres URL at the installed driver.
+
+        Providers hand out `postgres://` or `postgresql://`. SQLAlchemy rejects the
+        first outright and maps the second to psycopg2, which is not installed —
+        psycopg 3 is. An explicit `postgresql+<driver>://` is left alone.
+        """
+        for prefix in ("postgres://", "postgresql://"):
+            if value.startswith(prefix):
+                return "postgresql+psycopg://" + value[len(prefix) :]
+        return value
 
     # Stored as a raw string rather than a list: pydantic-settings would otherwise
     # insist on JSON for a list-typed field, and a comma-separated env var is far
@@ -150,6 +164,12 @@ class Settings(BaseSettings):
     orchestrator_max_relayed_line_chars: int = 2_000
 
     # --- Execution queue (milestone 6) --------------------------------------
+    # Whether this deployment runs a dispatcher at all. Set false where none can
+    # exist (a serverless host has no Docker and no long-lived process): Start is
+    # then refused rather than queueing a job that would wait forever, and the
+    # dashboard says why. This is a statement about the deployment, not a probe —
+    # true does not prove a dispatcher is running right now.
+    dispatcher_available: bool = True
     # The dispatcher drains queued jobs one at a time. These are dispatcher
     # policy, not per-orchestration execution settings, so they are deliberately
     # NOT frozen onto an orchestration (see FROZEN_PREFIXES below).

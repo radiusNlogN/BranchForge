@@ -110,8 +110,10 @@ def downgrade() -> None:
     _require_foreign_keys_off()
 
     # SQLite cannot drop a column in place, so this one direction does rebuild the
-    # table — with the same guards 0005 uses.
-    with op.batch_alter_table("patch_attempts", recreate="always") as batch:
+    # table — with the same guards 0005 uses. Postgres drops it natively, and a
+    # rebuild there would fail on the primary key child tables reference.
+    recreate = "always" if op.get_bind().dialect.name == "sqlite" else "auto"
+    with op.batch_alter_table("patch_attempts", recreate=recreate) as batch:
         batch.drop_column("worker_pid")
 
     op.drop_index("ix_execution_jobs_created_at", table_name="execution_jobs")

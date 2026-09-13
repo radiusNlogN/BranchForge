@@ -18,6 +18,16 @@ def test_health(client: TestClient) -> None:
     response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["dispatcher_available"] is True
+
+
+def test_health_reports_a_deployment_without_a_dispatcher(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "dispatcher_available", False)
+    assert client.get("/api/health").json()["dispatcher_available"] is False
 
 
 def test_create_then_retrieve_persisted_run(client: TestClient) -> None:

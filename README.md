@@ -958,7 +958,8 @@ edit them; neither contains secrets.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `sqlite:///./branchforge.db` | SQLAlchemy URL, shared by the app and Alembic |
+| `DATABASE_URL` | `sqlite:///./branchforge.db` | SQLAlchemy URL, shared by the app and Alembic. A plain `postgres://` / `postgresql://` URL is rewritten to use psycopg 3 |
+| `DISPATCHER_AVAILABLE` | `true` | Set `false` on a deployment with no dispatcher: Start is refused, polling stops, and the dashboard says why |
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated allowed browser origins |
 | `RUN_LIST_DEFAULT_LIMIT` | `25` | Default `GET /api/runs` page size |
 | `RUN_LIST_MAX_LIMIT` | `100` | Hard ceiling for `limit` |
@@ -1273,8 +1274,11 @@ Choices made now so a worker process can be added next without rework:
   or multi-tenancy. Without such a gate in front of it, do not expose this beyond localhost.
 - **SQLite, with a handful of local writers.** An orchestrator and its children are several processes
   writing short transactions to one SQLite file, relying on SQLite's busy timeout (30s); that is
-  adequate for three attempts on one machine and not a design for many concurrent orchestrations. No
-  Postgres configuration — `DATABASE_URL` is the seam where that changes. `deploy/` documents one
+  adequate for three attempts on one machine and not a design for many concurrent orchestrations.
+  The API and the migrations also run on Postgres (checked against Postgres 17), which is enough for
+  a view-only deployment such as Vercel plus Supabase with `DISPATCHER_AVAILABLE=false`. Execution is
+  still SQLite-only: the dispatcher refuses any other database, and the workers are untested on
+  Postgres. `deploy/` documents one
   supported way to run this on a single Ubuntu host (systemd units plus a Caddy reverse proxy); it
   does not change the SQLite/single-writer-process model described above.
 - **The run list is a single bounded page** — no pagination cursors, filtering, or search.

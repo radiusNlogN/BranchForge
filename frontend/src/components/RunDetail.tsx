@@ -67,7 +67,15 @@ export const JOB_WORDS: Record<string, string> = {
 /** A short issue description needs no disclosure; a long one does. */
 const INLINE_DESCRIPTION_LIMIT = 280;
 
-function JobState({ job, polling }: { job: ExecutionJob; polling: boolean }) {
+function JobState({
+  job,
+  polling,
+  dispatcherAvailable,
+}: {
+  job: ExecutionJob;
+  polling: boolean;
+  dispatcherAvailable: boolean | null;
+}) {
   return (
     <section className="inspection">
       <div className="inspection__header">
@@ -89,15 +97,24 @@ function JobState({ job, polling }: { job: ExecutionJob; polling: boolean }) {
       {job.status === "queued" ? (
         <div className="empty">
           <p className="empty__title">Queued — nothing is running yet</p>
-          <p className="empty__text">
-            This job waits until a dispatcher process picks it up. If none is running, start one
-            from the <code>backend/</code> directory:
-          </p>
-          <pre className="command">{dispatchCommand()}</pre>
-          <p className="muted small">
-            One dispatcher per database, on this machine. It needs <code>ANTHROPIC_API_KEY</code>,
-            Docker, and the runner image.
-          </p>
+          {dispatcherAvailable === false ? (
+            <p className="empty__text">
+              This deployment runs no dispatcher, so nothing here will pick this job up. It can
+              still be cancelled.
+            </p>
+          ) : (
+            <>
+              <p className="empty__text">
+                This job waits until a dispatcher process picks it up. If none is running, start
+                one from the <code>backend/</code> directory:
+              </p>
+              <pre className="command">{dispatchCommand()}</pre>
+              <p className="muted small">
+                One dispatcher per database, on this machine. It needs{" "}
+                <code>ANTHROPIC_API_KEY</code>, Docker, and the runner image.
+              </p>
+            </>
+          )}
         </div>
       ) : null}
 
@@ -154,7 +171,13 @@ function JobState({ job, polling }: { job: ExecutionJob; polling: boolean }) {
   );
 }
 
-function NotStartedYet({ run }: { run: RunDetailData }) {
+function NotStartedYet({
+  run,
+  dispatcherAvailable,
+}: {
+  run: RunDetailData;
+  dispatcherAvailable: boolean | null;
+}) {
   if (!canStart(run)) {
     if (run.status === "failed") {
       return (
@@ -179,6 +202,20 @@ function NotStartedYet({ run }: { run: RunDetailData }) {
       );
     }
     return null;
+  }
+
+  if (dispatcherAvailable === false) {
+    // No manual commands either: they need a shell on a host with the database,
+    // Docker, and the key, which is exactly what this deployment does not offer.
+    return (
+      <div className="empty">
+        <p className="empty__title">Cannot be started on this deployment</p>
+        <p className="empty__text">
+          This deployment runs no dispatcher, so nothing here inspects repositories, calls an AI
+          model, or runs tests. Runs can be created and viewed, but not started.
+        </p>
+      </div>
+    );
   }
 
   return (
@@ -251,6 +288,7 @@ export function AttemptEvidence({
 interface RunBodyProps {
   run: RunDetailData;
   polling: boolean;
+  dispatcherAvailable: boolean | null;
   /** The tab strip and its selected panel, supplied by the page. */
   attemptSlot: ReactNode;
 }
@@ -260,16 +298,16 @@ interface RunBodyProps {
  * This body used to take `onStart`/`actionPending` to drive a second Start
  * button of its own, which put two identical primary buttons on the page.
  */
-export function RunBody({ run, polling, attemptSlot }: RunBodyProps) {
+export function RunBody({ run, polling, dispatcherAvailable, attemptSlot }: RunBodyProps) {
   const description = run.issue_description;
   const descriptionIsLong = description.length > INLINE_DESCRIPTION_LIMIT;
 
   return (
     <>
       {run.job !== null ? (
-        <JobState job={run.job} polling={polling} />
+        <JobState job={run.job} polling={polling} dispatcherAvailable={dispatcherAvailable} />
       ) : (
-        <NotStartedYet run={run} />
+        <NotStartedYet run={run} dispatcherAvailable={dispatcherAvailable} />
       )}
 
       {/* Result before evidence. */}
@@ -297,7 +335,12 @@ export function RunBody({ run, polling, attemptSlot }: RunBodyProps) {
         )}
       </section>
 
-      <InspectionPanel runId={run.id} status={run.status} inspection={run.inspection} />
+      <InspectionPanel
+        runId={run.id}
+        status={run.status}
+        inspection={run.inspection}
+        dispatcherAvailable={dispatcherAvailable}
+      />
 
       {/*
         The run's identity stays visible.

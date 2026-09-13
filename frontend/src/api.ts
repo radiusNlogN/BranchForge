@@ -6,14 +6,24 @@
  * `{loc, msg}` objects, while other errors carry `detail` as a plain string.
  */
 
-import type { ExecutionJob, Run, RunCreateInput, RunDetail, RunProgress } from "./types";
+import type {
+  ExecutionJob,
+  Health,
+  Run,
+  RunCreateInput,
+  RunDetail,
+  RunProgress,
+} from "./types";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000").replace(
   /\/+$/,
   "",
 );
 
-export { API_BASE_URL };
+/** An empty base means same-origin requests (e.g. behind a `/api` rewrite). */
+const API_BASE_LABEL = API_BASE_URL || "this site's /api";
+
+export { API_BASE_LABEL, API_BASE_URL };
 
 /** Field-level messages keyed by request field name, e.g. `repository_url`. */
 export type FieldErrors = Partial<Record<keyof RunCreateInput, string>>;
@@ -103,7 +113,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     });
   } catch {
     throw new ApiError(
-      `Could not reach the BranchForge API at ${API_BASE_URL}. Is the backend running?`,
+      `Could not reach the BranchForge API at ${API_BASE_LABEL}. Is the backend running?`,
       0,
     );
   }
@@ -155,6 +165,11 @@ export function startRun(runId: string): Promise<ExecutionJob> {
   return request<ExecutionJob>(`/api/runs/${encodeURIComponent(runId)}/start`, {
     method: "POST",
   });
+}
+
+/** Liveness plus deployment facts, fetched once. */
+export function fetchHealth(): Promise<Health> {
+  return request<Health>("/api/health");
 }
 
 /** Request cancellation. Idempotent; a finished job comes back unchanged. */

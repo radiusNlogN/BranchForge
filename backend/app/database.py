@@ -42,6 +42,13 @@ def _engine_kwargs(database_url: str) -> dict[str, object]:
         # `timeout` is SQLite's busy wait: an orchestrator and its children are
         # several processes writing short transactions to one file.
         return {"connect_args": {"check_same_thread": False, "timeout": 30}}
+    if database_url.startswith("postgresql+psycopg"):
+        # A transaction-mode pooler (Supabase's on port 6543) may hand each
+        # transaction a different server connection, so a statement psycopg
+        # prepared on one is missing on the next. psycopg prepares a query after
+        # five runs; None disables that. Harmless on a direct connection.
+        # pre_ping discards pooled connections the pooler has since closed.
+        return {"connect_args": {"prepare_threshold": None}, "pool_pre_ping": True}
     return {}
 
 
