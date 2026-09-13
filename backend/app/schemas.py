@@ -19,6 +19,12 @@ from app.models import (
     ATTEMPT_STATUS_QUEUED,
     ATTEMPT_STATUS_RUNNING,
     ATTEMPT_STATUS_SUCCEEDED,
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_INTERRUPTED,
+    JOB_STATUS_QUEUED,
+    JOB_STATUS_RUNNING,
     MAX_PARALLEL_ATTEMPTS,
     MIN_PARALLEL_ATTEMPTS,
     ORCH_STATUS_COMPLETED,
@@ -385,17 +391,129 @@ class OrchestrationRead(BaseModel):
         return to_iso_utc(value) if value is not None else None
 
 
+class JobStatus(str, Enum):
+    """Did the dispatcher carry this run's workflow through?
+
+    Separate from every other status: a job can be cancelled while the inspection,
+    attempts, and verifications it already produced stay exactly as recorded.
+    `cancelled` is a person's decision; `interrupted` is the dispatcher shutting
+    down. They are not merged, because "someone stopped this" and "the machine
+    stopped" are different facts.
+    """
+
+    QUEUED = JOB_STATUS_QUEUED
+    RUNNING = JOB_STATUS_RUNNING
+    COMPLETED = JOB_STATUS_COMPLETED
+    FAILED = JOB_STATUS_FAILED
+    CANCELLED = JOB_STATUS_CANCELLED
+    INTERRUPTED = JOB_STATUS_INTERRUPTED
+
+
+class ExecutionJobRead(BaseModel):
+    """A persisted execution job.
+
+    `stage` is progress detail, not a status. `cancel_requested` stays visible
+    while an active job winds down: the job is not terminal until its children
+    have stopped and container cleanup has been confirmed.
+
+    `recovery_required` means this job was found `running` with no dispatcher
+    owning it — an abrupt crash. Its processes and containers may still be alive,
+    so nothing is replayed and no further job runs until a person has cleaned up.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    status: JobStatus
+    stage: str | None
+    cancel_requested: bool
+    recovery_required: bool
+    notes: list[str] | None = None
+    error_kind: str | None
+    error_message: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    @field_serializer("created_at", "started_at", "completed_at")
+    def _serialize_timestamp(self, value: datetime | None) -> str | None:
+        return to_iso_utc(value) if value is not None else None
+
+
+# --- Lightweight progress ----------------------------------------------------
+#
+# What a poll needs and nothing more. The detail endpoint embeds diffs, container
+# logs, event lists, inspection reports, and the comparison — megabytes for a run
+# with three attempts — and re-downloading all of that every couple of seconds to
+# learn that a status has not changed would be wasteful. These models therefore
+# carry scalars only, and `repository.run_progress` selects individual columns so
+# the heavy ones are never even loaded.
+
+
+class VerificationProgress(BaseModel):
+    status: VerificationStatus
+    outcome: str | None = None
+
+
+class AttemptProgress(BaseModel):
+    """One attempt's live state: enough to update a row, never its contents."""
+
+    attempt_index: int
+    status: AttemptStatus
+    error_kind: str | None = None
+    pipeline_error_kind: str | None = None
+    events_total: int = 0
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    verification: VerificationProgress | None = None
+
+    @field_serializer("started_at", "completed_at")
+    def _serialize_timestamp(self, value: datetime | None) -> str | None:
+        return to_iso_utc(value) if value is not None else None
+
+
+class OrchestrationProgress(BaseModel):
+    status: OrchestrationStatus
+    recommended_attempt_index: int | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    @field_serializer("started_at", "completed_at")
+    def _serialize_timestamp(self, value: datetime | None) -> str | None:
+        return to_iso_utc(value) if value is not None else None
+
+
+class RunProgressRead(BaseModel):
+    """The poll response: run status, job state, and one row per attempt."""
+
+    id: str
+    status: RunStatus
+    updated_at: datetime
+    job: ExecutionJobRead | None = None
+    orchestration: OrchestrationProgress | None = None
+    attempts: list[AttemptProgress] = Field(default_factory=list)
+
+    @field_serializer("updated_at")
+    def _serialize_timestamp(self, value: datetime) -> str:
+        return to_iso_utc(value)
+
+
 class RunDetailRead(RunRead):
     """A run plus its inspection, every attempt (each with its verification),
-    and the orchestration if there is one.
+    the orchestration if there is one, and the execution job if one was started.
 
     The list endpoint deliberately returns `RunRead` without these — they would
     make a list response unbounded. Legacy (manual) runs have one attempt and no
     orchestration.
+
+    `job` is included so Start/Cancel and the "needs a dispatcher" note render
+    from the persisted record on first load, not only after a poll tick.
     """
 
     inspection: InspectionRead | None = None
     orchestration: OrchestrationRead | None = None
+    job: ExecutionJobRead | None = None
     attempts: list[PatchAttemptRead] = Field(default_factory=list)
 
 

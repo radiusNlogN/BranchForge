@@ -13,7 +13,14 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 
 from app.database import Base
-from app.models import AttemptEvent, Inspection, PatchAttempt, Run, Verification
+from app.models import (
+    AttemptEvent,
+    ExecutionJob,
+    Inspection,
+    PatchAttempt,
+    Run,
+    Verification,
+)
 from sqlalchemy.orm import sessionmaker
 from tests.conftest import alembic_config
 
@@ -33,9 +40,14 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
     engine = create_engine(migration_db)
     try:
         inspector = inspect(engine)
-        assert {"runs", "inspections", "patch_attempts", "attempt_events", "verifications"} <= set(
-            inspector.get_table_names()
-        )
+        assert {
+            "runs",
+            "inspections",
+            "patch_attempts",
+            "attempt_events",
+            "verifications",
+            "execution_jobs",
+        } <= set(inspector.get_table_names())
 
         for table in (
             "runs",
@@ -43,6 +55,7 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
             "patch_attempts",
             "attempt_events",
             "verifications",
+            "execution_jobs",
         ):
             migrated = {column["name"] for column in inspector.get_columns(table)}
             expected = {column.name for column in Base.metadata.tables[table].columns}
@@ -92,6 +105,21 @@ def test_upgrade_creates_both_tables_matching_the_models(migration_db: str) -> N
         assert verification_fks[0]["referred_table"] == "patch_attempts"
         assert verification_fks[0]["constrained_columns"] == ["attempt_id"]
         assert verification_fks[0]["options"]["ondelete"] == "CASCADE"
+
+        # UNIQUE on execution_jobs.run_id is the enqueue claim: it is what makes
+        # two concurrent Start requests collapse onto one job instead of
+        # duplicating the work.
+        job_indexes = {
+            index["name"]: index["unique"] for index in inspector.get_indexes("execution_jobs")
+        }
+        assert job_indexes.get("ix_execution_jobs_run_id") == 1
+        assert job_indexes.get("ix_execution_jobs_created_at") == 0
+
+        job_fks = inspector.get_foreign_keys("execution_jobs")
+        assert len(job_fks) == 1
+        assert job_fks[0]["referred_table"] == "runs"
+        assert job_fks[0]["constrained_columns"] == ["run_id"]
+        assert job_fks[0]["options"]["ondelete"] == "CASCADE"
     finally:
         engine.dispose()
 
@@ -290,7 +318,7 @@ def test_upgrading_a_populated_0004_database_preserves_every_record(tmp_path: Pa
     command.upgrade(config, "head")
     after = _snapshot(path)
 
-    assert after["version"] == "0005"
+    assert after["version"] == "0006"
     assert after["attempts"] == before["attempts"]
     assert after["events"] == before["events"], "attempt events were lost in the rebuild"
     assert after["verifications"] == before["verifications"], "verifications were lost"
@@ -327,7 +355,11 @@ def test_a_refused_downgrade_changes_nothing(tmp_path: Path) -> None:
     config = alembic_config(f"sqlite:///{path}")
     command.upgrade(config, "0004")
     _seed_0004(path)
-    command.upgrade(config, "head")
+    # Deliberately 0005, not head: the claim under test is that the *refusal*
+    # leaves the database untouched. From head, alembic would legitimately apply
+    # 0006's own downgrade first and the version would change for a reason that
+    # has nothing to do with the refusal.
+    command.upgrade(config, "0005")
 
     connection = sqlite3.connect(path)
     connection.execute(
@@ -395,6 +427,158 @@ def test_the_migration_connection_restores_foreign_keys_even_after_a_failure(
     with pytest.raises(RuntimeError):
         command.upgrade(config, "head")
     assert seen and all(value == 1 for value in seen), seen
+
+
+# --- 0005 -> 0006 preserves existing records -----------------------------------
+#
+# 0006 only adds, so it is far safer than 0005 — but "only adds" is exactly the
+# kind of claim worth checking against a populated database rather than trusting,
+# because every other test here builds an empty one.
+
+
+def _seed_0005(path: str) -> None:
+    """A 0005-shaped database with an orchestration, attempts, events, and a result."""
+    connection = sqlite3.connect(path, isolation_level=None)
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute(
+        "INSERT INTO runs (id, repository_url, issue_description, max_parallel_attempts, "
+        "status, created_at, updated_at) VALUES "
+        "('run-1', 'https://github.com/o/r', 'x', 2, 'ready', '2026-01-01', '2026-01-01')"
+    )
+    connection.execute(
+        "INSERT INTO inspections (id, run_id, commit_sha, tree_truncated, started_at) "
+        "VALUES ('insp-1', 'run-1', ?, 0, '2026-01-01')",
+        ("a" * 40,),
+    )
+    connection.execute(
+        "INSERT INTO orchestrations (id, run_id, status, requested_attempts, "
+        "concurrency_limit, effective_concurrency, model, commit_sha, profile, image_ref, "
+        "image_id, workspace_root, execution_config, created_at) VALUES "
+        "('orch-1', 'run-1', 'completed', 2, 2, 2, 'm', ?, 'python-pytest', 'img:1', "
+        "'sha256:abc', '/tmp/ws', '{}', '2026-01-01')",
+        ("a" * 40,),
+    )
+    for index in (1, 2):
+        connection.execute(
+            "INSERT INTO patch_attempts (id, run_id, attempt_index, orchestration_id, status, "
+            "model, commit_sha, diff, started_at, completed_at) VALUES "
+            "(?, 'run-1', ?, 'orch-1', 'succeeded', 'm', ?, '--- a/x\n+++ b/x\n', "
+            "'2026-01-01', '2026-01-02')",
+            (f"att-{index}", index, "a" * 40),
+        )
+    for seq in range(1, 4):
+        connection.execute(
+            "INSERT INTO attempt_events (id, attempt_id, seq, kind, summary, created_at) "
+            "VALUES (?, 'att-1', ?, 'file_read', 'Read x', '2026-01-01')",
+            (f"ev-{seq}", seq),
+        )
+    connection.execute(
+        "INSERT INTO verifications (id, attempt_id, status, outcome, patch_applied, "
+        "patch_touched_tests, started_at) VALUES "
+        "('ver-1', 'att-1', 'completed', 'fix_demonstrated', 1, 0, '2026-01-01')"
+    )
+    connection.close()
+
+
+def test_upgrading_a_populated_0005_database_preserves_every_record(tmp_path: Path) -> None:
+    path = str(tmp_path / "populated0005.db")
+    config = alembic_config(f"sqlite:///{path}")
+    command.upgrade(config, "0005")
+    _seed_0005(path)
+    before = _snapshot(path)
+
+    command.upgrade(config, "head")
+    after = _snapshot(path)
+
+    assert after["version"] == "0006"
+    assert after["events"] == before["events"], "attempt events were lost"
+    assert after["verifications"] == before["verifications"], "verifications were lost"
+    assert after["attempts"] == before["attempts"], "patch attempts were lost"
+    assert "worker_pid" in after["columns"]
+
+    connection = sqlite3.connect(path)
+    try:
+        # The new column exists and defaults to NULL: no attempt has a live worker.
+        assert connection.execute(
+            "SELECT DISTINCT worker_pid FROM patch_attempts"
+        ).fetchall() == [(None,)]
+        assert connection.execute("SELECT COUNT(*) FROM execution_jobs").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+
+    # A job inserts, only one per run is allowed, and deleting the run cascades.
+    engine = create_engine(f"sqlite:///{path}")
+    try:
+        with sessionmaker(bind=engine)() as session:
+            session.add(ExecutionJob(run_id="run-1"))
+            session.commit()
+            session.add(ExecutionJob(run_id="run-1"))
+            with pytest.raises(IntegrityError):
+                session.commit()
+            session.rollback()
+
+            session.delete(session.get(Run, "run-1"))
+            session.commit()
+            assert session.query(ExecutionJob).count() == 0
+    finally:
+        engine.dispose()
+
+
+def test_downgrading_0006_refuses_while_jobs_exist(tmp_path: Path) -> None:
+    """Revision 0005 cannot hold a job, and deleting them to fit would lose evidence."""
+    path = str(tmp_path / "jobs.db")
+    config = alembic_config(f"sqlite:///{path}")
+    command.upgrade(config, "0005")
+    _seed_0005(path)
+    command.upgrade(config, "head")
+
+    connection = sqlite3.connect(path, isolation_level=None)
+    connection.execute(
+        "INSERT INTO execution_jobs (id, run_id, status, cancel_requested, "
+        "recovery_required, created_at) VALUES "
+        "('job-1', 'run-1', 'completed', 0, 0, '2026-01-01')"
+    )
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="Refusing to downgrade"):
+        command.downgrade(config, "0005")
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0006"
+        assert connection.execute("SELECT COUNT(*) FROM execution_jobs").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_downgrading_0006_with_no_jobs_removes_the_table_and_column(tmp_path: Path) -> None:
+    path = str(tmp_path / "clean.db")
+    config = alembic_config(f"sqlite:///{path}")
+    command.upgrade(config, "0005")
+    _seed_0005(path)
+    command.upgrade(config, "head")
+    before = _snapshot(path)
+
+    command.downgrade(config, "0005")
+
+    after = _snapshot(path)
+    assert after["version"] == "0005"
+    assert "worker_pid" not in after["columns"]
+    # The column drop rebuilds patch_attempts, so the child rows are the thing to
+    # check: this is the same hazard 0005 carried.
+    assert after["events"] == before["events"], "attempt events were lost in the rebuild"
+    assert after["verifications"] == before["verifications"], "verifications were lost"
+
+    connection = sqlite3.connect(path)
+    try:
+        tables = {
+            row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "execution_jobs" not in tables
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
 
 
 def test_a_verification_cannot_reference_a_missing_attempt(migration_db: str) -> None:

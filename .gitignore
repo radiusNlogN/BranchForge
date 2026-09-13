@@ -12,6 +12,7 @@ venv/
 *.db-journal
 *.sqlite
 *.sqlite3
+*.dispatcher.lock
 
 # Environment files — only .env.example is tracked
 .env

@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -147,6 +148,50 @@ class Settings(BaseSettings):
     orchestrator_drain_timeout_seconds: float = 10.0
     # Child output is relayed line by line; longer lines are cut to this.
     orchestrator_max_relayed_line_chars: int = 2_000
+
+    # --- Execution queue (milestone 6) --------------------------------------
+    # The dispatcher drains queued jobs one at a time. These are dispatcher
+    # policy, not per-orchestration execution settings, so they are deliberately
+    # NOT frozen onto an orchestration (see FROZEN_PREFIXES below).
+    dispatcher_poll_seconds: float = 2.0
+    # How often an active job's cancellation flag is re-read while a child runs.
+    dispatcher_cancel_poll_seconds: float = 0.5
+    # Seconds a child gets after SIGTERM before SIGKILL. This MUST exceed the
+    # orchestrator's own shutdown budget — it spends up to
+    # orchestrator_child_grace_seconds + orchestrator_drain_timeout_seconds +
+    # verify_cleanup_timeout_seconds saving a comparison and sweeping its
+    # containers. Killing it sooner would throw that work away and leave
+    # containers behind for the dispatcher to find.
+    dispatcher_child_grace_seconds: float = 90.0
+    # After a child exits, how long its output reader may take to hit EOF.
+    dispatcher_drain_timeout_seconds: float = 10.0
+    # How long an orphaned attempt worker gets after SIGTERM before SIGKILL.
+    dispatcher_worker_grace_seconds: float = 10.0
+    # Bound on the operator notes kept on one job, so repeated dispatcher
+    # restarts cannot grow the row without limit.
+    dispatcher_max_job_notes: int = 20
+
+    def dispatcher_lock_path(self) -> str:
+        """The canonical lock-file path for this database.
+
+        Derived from the *resolved* database file, never from a separate setting:
+        two spellings of one database (`./branchforge.db`, `branchforge.db`, a
+        symlink, a relative path from another directory) must map to the same lock
+        file, or two dispatchers would each hold "the" lock and drain the same
+        queue. There is deliberately no override for that reason.
+
+        `flock` is per-host, so this enforces one dispatcher per database *on this
+        machine*. Networked filesystems do not preserve those semantics, which is
+        why this is documented as a single-host deployment.
+        """
+        url = make_url(self.database_url)
+        if url.get_backend_name() != "sqlite" or not url.database or url.database == ":memory:":
+            raise ValueError(
+                "The dispatcher supports a file-backed SQLite database only: its "
+                "single-instance lock is an OS file lock beside the database file. "
+                f"DATABASE_URL is {self.database_url!r}."
+            )
+        return os.path.realpath(os.path.abspath(url.database)) + ".dispatcher.lock"
 
     @property
     def agent_model_context_headroom_tokens(self) -> int:

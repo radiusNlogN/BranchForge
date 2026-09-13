@@ -63,6 +63,8 @@ EXIT_DOCKER_UNAVAILABLE = 6
 EXIT_LEGACY_ATTEMPTS = 7
 EXIT_AMBIGUOUS = 8
 EXIT_ORCHESTRATION_FAILED = 1
+EXIT_DISPATCHER_LOCKED = 9
+EXIT_RECOVERY_REQUIRED = 10
 EXIT_INTERRUPTED = 130
 
 SessionFactory = Callable[[], Session] | sessionmaker[Session]
@@ -832,7 +834,7 @@ def install_child_signal_handlers() -> None:
 
 # --- CLI -----------------------------------------------------------------------
 
-PUBLIC_COMMANDS = "{inspect,propose,verify,orchestrate}"
+PUBLIC_COMMANDS = "{inspect,propose,verify,orchestrate,dispatch}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -877,6 +879,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-id", required=True, help="UUID of an inspected run with no attempts."
     )
 
+    subparsers.add_parser(
+        "dispatch",
+        help=(
+            "Drain the execution queue: run each started run's inspection and "
+            "orchestration. One dispatcher per database, on this host."
+        ),
+    )
+
     # Internal: what an orchestrator launches per attempt. Hidden from the
     # command list; its arguments are validated against the database.
     child_parser = subparsers.add_parser("run-attempt")
@@ -899,6 +909,12 @@ def main(argv: list[str] | None = None) -> int:
         from app.orchestrator import orchestrate_run
 
         return orchestrate_run(args.run_id)
+    if args.command == "dispatch":
+        # Imported here for the same reason as `orchestrate`: app.dispatcher
+        # imports from this module at module scope.
+        from app.dispatcher import run_dispatcher
+
+        return run_dispatcher()
     if args.command == "run-attempt":
         install_child_signal_handlers()
         return run_attempt_pipeline(args.attempt_id, args.orchestration_id)

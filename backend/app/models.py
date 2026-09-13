@@ -54,6 +54,30 @@ ORCH_STATUS_COMPLETED = "completed"
 ORCH_STATUS_INTERRUPTED = "interrupted"
 ORCH_STATUS_FAILED = "failed"
 
+# Execution-job lifecycle: did the *dispatcher* carry this run's workflow through?
+# Deliberately separate from every status above — a job can be cancelled while the
+# inspection, attempts, and verifications it already produced stay exactly as they
+# were recorded. `cancelled` means a person asked for it to stop; `interrupted`
+# means the dispatcher itself shut down. Keeping those apart is the whole point:
+# one is a decision, the other is an operational event.
+JOB_STATUS_QUEUED = "queued"
+JOB_STATUS_RUNNING = "running"
+JOB_STATUS_COMPLETED = "completed"
+JOB_STATUS_FAILED = "failed"
+JOB_STATUS_CANCELLED = "cancelled"
+JOB_STATUS_INTERRUPTED = "interrupted"
+
+JOB_TERMINAL_STATUSES = (
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_INTERRUPTED,
+)
+
+# Which child the dispatcher is running. Progress detail, never a status.
+JOB_STAGE_INSPECTING = "inspecting"
+JOB_STAGE_ORCHESTRATING = "orchestrating"
+
 MIN_PARALLEL_ATTEMPTS = 1
 MAX_PARALLEL_ATTEMPTS = 3
 
@@ -104,6 +128,9 @@ class Run(Base):
         order_by="PatchAttempt.attempt_index",
     )
     orchestration: Mapped["Orchestration | None"] = relationship(
+        back_populates="run", uselist=False, cascade="all, delete-orphan"
+    )
+    job: Mapped["ExecutionJob | None"] = relationship(
         back_populates="run", uselist=False, cascade="all, delete-orphan"
     )
 
@@ -232,6 +259,80 @@ class Orchestration(Base):
         return f"<Orchestration run_id={self.run_id!r} status={self.status!r}>"
 
 
+class ExecutionJob(Base):
+    """One request to run a run's whole workflow: inspect, then orchestrate.
+
+    `run_id` is UNIQUE, so inserting this row *is* the enqueue claim. Repeated
+    `POST /start` calls collapse onto the one job and two racing requests cannot
+    create duplicate work — the same mechanism as `orchestrations.run_id`. Because
+    retries are out of scope, a run is started at most once.
+
+    The job's status describes the *dispatcher's* handling of the run and nothing
+    else. It never rewrites what the inspector, the agents, or the verifier
+    recorded: a cancelled job leaves every artifact already produced exactly as it
+    was. `stage` is progress detail, not a status.
+
+    `cancel_requested` is a request, not a state. A queued job can go straight to
+    `cancelled`, but an active one stays non-terminal until its children have
+    actually stopped and container cleanup has been confirmed — otherwise the UI
+    would report a cancellation that had not happened yet.
+    """
+
+    __tablename__ = "execution_jobs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=JOB_STATUS_QUEUED, server_default=JOB_STATUS_QUEUED
+    )
+    stage: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Which dispatcher last owned this job. Informational only: exclusivity is
+    # enforced by the OS-level dispatcher lock, never by trusting this column.
+    dispatcher_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # True when this job was found `running` with no dispatcher owning it — an
+    # abrupt crash. Its children and containers may still be alive, so nothing is
+    # replayed and no further job is launched until a person has cleaned up.
+    recovery_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    # Bounded operator notes. Appended de-duplicated, so repeated dispatcher
+    # restarts cannot grow this row without limit.
+    notes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+
+    error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, index=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    run: Mapped["Run"] = relationship(back_populates="job")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<ExecutionJob run_id={self.run_id!r} status={self.status!r} stage={self.stage!r}>"
+
+
 class PatchAttempt(Base):
     """One bounded agent attempt to propose a patch for a run.
 
@@ -294,6 +395,19 @@ class PatchAttempt(Base):
     # Written only by orchestrator reconciliation; never changes `status`.
     pipeline_error_kind: Mapped[str | None] = mapped_column(String(50), nullable=True)
     pipeline_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The OS process id of the child running this attempt's pipeline, recorded by
+    # the coordinator at spawn and cleared when it exits.
+    #
+    # This exists because an attempt child is started with `start_new_session=True`
+    # and therefore leads its OWN session: signalling the coordinator's process
+    # group provably cannot reach it. If a dispatcher has to force-kill a
+    # coordinator, this column is the only record of what that coordinator had
+    # running, and without it those children would keep calling the model and
+    # starting containers. A pid alone is not proof of identity — pids are reused —
+    # so a signaller must confirm the process is still this attempt's worker before
+    # signalling it.
+    worker_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # NULL while queued: a reserved slot has not started. No default on purpose —
     # SQLAlchemy would fire it for an explicit None, giving queued rows a start

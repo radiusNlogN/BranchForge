@@ -197,36 +197,21 @@ interface InspectionPanelProps {
   runId: string;
   status: RunStatus;
   inspection: Inspection | null;
-  refreshing: boolean;
-  onRefresh: () => void;
 }
 
-export function InspectionPanel({
-  runId,
-  status,
-  inspection,
-  refreshing,
-  onRefresh,
-}: InspectionPanelProps) {
+/** Refresh lives once, in the run page header — not in each panel. */
+export function InspectionPanel({ runId, status, inspection }: InspectionPanelProps) {
   return (
     <section className="inspection">
       <div className="inspection__header">
         <h3>Repository inspection</h3>
-        <button
-          type="button"
-          className="button button--ghost"
-          onClick={onRefresh}
-          disabled={refreshing}
-        >
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
       </div>
 
       {status === "pending" ? (
         <div className="empty">
           <p className="empty__title">Not inspected yet</p>
           <p className="empty__text">
-            Nothing schedules this automatically. Run the worker, then press Refresh:
+            Starting this run inspects the repository first. To do it by hand instead:
           </p>
           <pre className="command">{workerCommand(runId)}</pre>
           <p className="muted small">Run it from the <code>backend/</code> directory.</p>

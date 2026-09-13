@@ -17,15 +17,16 @@ export function StatusBadge({ status }: { status: RunStatus }) {
 }
 
 /**
- * A lifecycle badge for an attempt, verification, or orchestration. It states
- * whether something *ran*, never whether a patch is good — outcomes are words.
+ * A lifecycle badge for an attempt, verification, orchestration, or execution
+ * job. It states whether something *ran*, never whether a patch is good —
+ * outcomes are words.
  */
 export function LifecycleBadge({
   family,
   status,
   label,
 }: {
-  family: "attempt" | "verify" | "orch";
+  family: "attempt" | "verify" | "orch" | "job";
   status: string;
   label?: string;
 }) {

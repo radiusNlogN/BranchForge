@@ -287,6 +287,11 @@ class Coordinator:
             self.state.active[spec.attempt_id] = proc
             self.state.max_active = max(self.state.max_active, len(self.state.active))
             self.emit(f"{prefix} started (pid {proc.pid})")
+            # Recorded so that whoever supervises *us* can still reach this child
+            # if we are killed outright. It leads its own session (above), so
+            # signalling our process group would never touch it, and an orphan
+            # would carry on calling the model and starting containers.
+            await asyncio.to_thread(self._record_worker_pid, spec.attempt_id, proc.pid)
             if self.state.interrupted_by is not None:
                 # A stop arrived while this child was being spawned.
                 _signal_group(proc.pid, signal.SIGKILL if self.state.kill_now else signal.SIGTERM)
@@ -309,6 +314,9 @@ class Coordinator:
                         f"and was cancelled."
                     )
                 self.state.active.pop(spec.attempt_id, None)
+                # Reaped, so the recorded pid no longer refers to anything of
+                # ours and must not be signalled by a supervisor later.
+                await asyncio.to_thread(self._record_worker_pid, spec.attempt_id, None)
 
             description = describe_exit(returncode)
             interrupted = self.state.interrupted_by is not None
@@ -341,6 +349,10 @@ class Coordinator:
             self.emit(f"{prefix} finished ({description}); pipeline: {pipeline}")
         # The slot is released only here: after exit, drain, reconciliation, and
         # confirmed (or recorded-as-unconfirmed) cleanup.
+
+    def _record_worker_pid(self, attempt_id: str, pid: int | None) -> None:
+        with _session(self.session_factory) as db:
+            repository.record_attempt_worker_pid(db, attempt_id=attempt_id, worker_pid=pid)
 
     def _reconcile(self, attempt_id: str, interrupted: bool, description: str) -> str:
         with _session(self.session_factory) as db:

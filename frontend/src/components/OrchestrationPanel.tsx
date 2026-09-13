@@ -57,7 +57,7 @@ function ComparisonSummary({ orchestration }: { orchestration: Orchestration }) 
   if (comparison === null) {
     return (
       <p className="muted small">
-        The comparison is written once every attempt has finished. Press Refresh to check.
+        The comparison is written once every attempt has finished.
       </p>
     );
   }
@@ -114,11 +114,16 @@ function ComparisonSummary({ orchestration }: { orchestration: Orchestration }) 
 interface Props {
   orchestration: Orchestration;
   attempts: PatchAttempt[];
-  refreshing: boolean;
-  onRefresh: () => void;
+  /**
+   * True when the run's job was cancelled. `interrupted` is all an orchestrator
+   * can record about being stopped — it cannot know *why* — so without this the
+   * panel would report "interrupted" beside a job that plainly says "cancelled",
+   * and the two would look like they disagreed about the same event.
+   */
+  cancelRequested: boolean;
 }
 
-export function OrchestrationPanel({ orchestration, attempts, refreshing, onRefresh }: Props) {
+export function OrchestrationPanel({ orchestration, attempts, cancelRequested }: Props) {
   const comparison = orchestration.comparison;
   const finished = orchestration.completed_at !== null;
   return (
@@ -127,26 +132,19 @@ export function OrchestrationPanel({ orchestration, attempts, refreshing, onRefr
         <h3>Competing attempts</h3>
         <div className="inspection__actions">
           <LifecycleBadge family="orch" status={orchestration.status} />
-          <button
-            type="button"
-            className="button button--ghost"
-            onClick={onRefresh}
-            disabled={refreshing}
-          >
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </button>
         </div>
       </div>
 
       {orchestration.status === "queued" || orchestration.status === "running" ? (
         <p className="muted small">
-          The orchestrator process is working. Nothing polls automatically — press Refresh. If
-          that process was killed outright, this state can remain; recovery is not implemented.
+          The orchestrator process is working. While a job is running this page updates itself;
+          Refresh still works. If that process was killed outright, this state can remain —
+          automatic recovery is not implemented.
         </p>
       ) : null}
       {orchestration.status === "interrupted" ? (
         <div className="callout callout--warn" role="note">
-          <strong>Interrupted.</strong>
+          <strong>{cancelRequested ? "Stopped by cancellation." : "Interrupted."}</strong>
           <p>
             {orchestration.error_message} Attempts that had not finished are marked interrupted,
             and their containers were removed.
@@ -290,7 +288,7 @@ export function OrchestrationPanel({ orchestration, attempts, refreshing, onRefr
       <p className="muted small">
         Each attempt had the same issue, inspection report, and commit, and differed only in the
         recorded investigation emphasis. That does not guarantee the attempts reached different
-        fixes. Full diffs, activity, and test output for each attempt are below.
+        fixes. Select an attempt below for its diff, activity, and test output.
       </p>
     </section>
   );

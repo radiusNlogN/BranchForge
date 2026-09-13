@@ -65,11 +65,14 @@ function EventList({ events, total }: { events: AttemptEvent[]; total: number })
 interface PatchAttemptPanelProps {
   attempt: PatchAttempt;
   heading: string;
-  refreshing: boolean;
-  onRefresh: () => void;
 }
 
-export function PatchAttemptPanel({ attempt, heading, refreshing, onRefresh }: PatchAttemptPanelProps) {
+/**
+ * Refresh lives once, in the run page header. This panel used to carry its own
+ * copy — as did the inspection, orchestration, and verification panels — four
+ * buttons calling one handler with one disabled flag.
+ */
+export function PatchAttemptPanel({ attempt, heading }: PatchAttemptPanelProps) {
   const hasVerification = attempt.verification !== null;
   return (
     <section className="inspection">
@@ -77,14 +80,6 @@ export function PatchAttemptPanel({ attempt, heading, refreshing, onRefresh }: P
         <h3>{heading}</h3>
         <div className="inspection__actions">
           <LifecycleBadge family="attempt" status={attempt.status} label={`proposal ${attempt.status}`} />
-          <button
-            type="button"
-            className="button button--ghost"
-            onClick={onRefresh}
-            disabled={refreshing}
-          >
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </button>
         </div>
       </div>
 
@@ -92,7 +87,7 @@ export function PatchAttemptPanel({ attempt, heading, refreshing, onRefresh }: P
         <div className="empty">
           <p className="empty__title">Reserved, waiting for a slot</p>
           <p className="empty__text">
-            The orchestrator starts this attempt when a concurrency slot frees up. Press Refresh.
+            The orchestrator starts this attempt when a concurrency slot frees up.
           </p>
         </div>
       ) : null}
@@ -101,8 +96,9 @@ export function PatchAttemptPanel({ attempt, heading, refreshing, onRefresh }: P
         <div className="empty">
           <p className="empty__title">Agent is working</p>
           <p className="empty__text">
-            Press Refresh to see newly recorded activity. If the worker process was killed outright,
-            the attempt can stay in this state — recovery and retries are not implemented.
+            Newly recorded activity appears as the job progresses. If the worker process was
+            killed outright, the attempt can stay in this state — automatic recovery and retries
+            are not implemented.
           </p>
         </div>
       ) : null}

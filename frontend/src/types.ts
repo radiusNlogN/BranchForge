@@ -202,10 +202,101 @@ export interface Orchestration {
   completed_at: string | null;
 }
 
+/**
+ * Did the dispatcher carry this run's workflow through? Independent of every
+ * other status: a cancelled job leaves the inspection, patches, and test results
+ * it already produced exactly as they were recorded.
+ *
+ * `cancelled` is a person's decision; `interrupted` is the dispatcher shutting
+ * down. They are separate because those are different facts.
+ */
+export type ExecutionJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface ExecutionJob {
+  id: string;
+  run_id: string;
+  status: ExecutionJobStatus;
+  /** Which child is running now: "inspecting" | "orchestrating". Detail, not status. */
+  stage: string | null;
+  /** A request, not a state — an active job stays non-terminal until cleanup is confirmed. */
+  cancel_requested: boolean;
+  /** Found running with no dispatcher: its processes and containers may still be alive. */
+  recovery_required: boolean;
+  notes: string[] | null;
+  error_kind: string | null;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/** A job nobody is going to advance any further. */
+export function isJobTerminal(job: ExecutionJob | null): boolean {
+  if (job === null) return true;
+  return (
+    job.status === "completed" ||
+    job.status === "failed" ||
+    job.status === "cancelled" ||
+    job.status === "interrupted"
+  );
+}
+
+/** Shown so the user can copy the command that actually drains the queue. */
+export function dispatchCommand(): string {
+  return "uv run python -m app.worker dispatch";
+}
+
+/** Mirrors the backend's lightweight progress schemas. */
+
+export interface VerificationProgress {
+  status: VerificationStatus;
+  outcome: string | null;
+}
+
+export interface AttemptProgress {
+  attempt_index: number;
+  status: AttemptStatus;
+  error_kind: string | null;
+  pipeline_error_kind: string | null;
+  events_total: number;
+  started_at: string | null;
+  completed_at: string | null;
+  verification: VerificationProgress | null;
+}
+
+export interface OrchestrationProgress {
+  status: OrchestrationStatus;
+  recommended_attempt_index: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+/**
+ * The poll response. Carries scalars only — no diffs, logs, events, reports, or
+ * comparison — so repeating it every couple of seconds stays cheap. Full
+ * artifacts come from the detail endpoint when something actually changes.
+ */
+export interface RunProgress {
+  id: string;
+  status: RunStatus;
+  updated_at: string;
+  job: ExecutionJob | null;
+  orchestration: OrchestrationProgress | null;
+  attempts: AttemptProgress[];
+}
+
 /** The run detail endpoint returns the run plus its inspection, attempts, and orchestration. */
 export interface RunDetail extends Run {
   inspection: Inspection | null;
   orchestration: Orchestration | null;
+  /** `null` until the run has been started. */
+  job: ExecutionJob | null;
   /** Ordered by attempt_index. One element for a manual run. */
   attempts: PatchAttempt[];
 }
