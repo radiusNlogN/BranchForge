@@ -344,6 +344,143 @@ def test_turn_budget_exhausted(ready_run, session_factory):
     assert run_status == RUN_STATUS_READY
 
 
+BAD_DIFF = "--- a/x.py\n+++ b/x.py\n@@ -1,9 +1,9 @@\n context\n"
+
+
+def _last_user_blocks(model: ScriptedModelClient, request: int) -> list[dict[str, Any]]:
+    """Content blocks of the final user message in one generation request."""
+    content = model.seen_messages[request][-1]["content"]
+    return content if isinstance(content, list) else []
+
+
+def test_the_budget_is_stated_in_the_first_message(ready_run, session_factory):
+    config = agent_settings(agent_max_turns=5, agent_max_tool_calls=9, agent_max_patch_repair_turns=2)
+    model = ScriptedModelClient([make_turn(tool_calls=[submit_call()])])
+    assert propose(ready_run, session_factory, model, FakeGitHub(), config) == worker.EXIT_OK
+
+    prompt = model.seen_messages[0][0]["content"]
+    assert "## Budget" in prompt
+    assert "at most 5 model responses and 9 tool calls" in prompt
+    assert "up to 2 correction turn(s)" in prompt
+
+
+def test_the_final_turn_is_announced_after_the_tool_results(ready_run, session_factory):
+    config = agent_settings(agent_max_turns=2)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[read_call("a.py")]),
+        make_turn(tool_calls=[submit_call()]),
+    ])
+    github = FakeGitHub(files={"a.py": "1\n"})
+    assert propose(ready_run, session_factory, model, github, config) == worker.EXIT_OK
+
+    blocks = _last_user_blocks(model, 1)
+    # The tool result comes first and is untouched; the notice is its own block after it.
+    assert [b["type"] for b in blocks] == ["tool_result", "text"]
+    assert "final turn" in blocks[1]["text"]
+    assert "final turn" not in str(blocks[0]["content"])
+    _, events, _ = attempt_of(session_factory, ready_run)
+    assert any(kind == "final_turn_notice" for _, kind, _ in events)
+
+
+def test_no_final_turn_notice_before_the_last_turn(ready_run, session_factory):
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[read_call("a.py")]),
+        make_turn(tool_calls=[submit_call()]),
+    ])
+    github = FakeGitHub(files={"a.py": "1\n"})
+    assert propose(ready_run, session_factory, model, github) == worker.EXIT_OK  # 8 turns
+    assert [b["type"] for b in _last_user_blocks(model, 1)] == ["tool_result"]
+
+
+def test_a_patch_rejected_on_the_final_turn_gets_a_correction_turn(ready_run, session_factory):
+    """The failure seen live: a rejected patch on turn N used to end the attempt."""
+    config = agent_settings(agent_max_turns=2, agent_max_patch_repair_turns=2)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[read_call("a.py")]),
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s1")]),
+        make_turn(tool_calls=[submit_call(call_id="s2")]),
+    ])
+    github = FakeGitHub(files={"a.py": "1\n"})
+    assert propose(ready_run, session_factory, model, github, config) == worker.EXIT_OK
+
+    attempt, events, _ = attempt_of(session_factory, ready_run)
+    assert attempt.status == ATTEMPT_STATUS_SUCCEEDED
+    assert attempt.diff == VALID_DIFF
+    assert model.calls == 3
+    kinds = [k for _, k, _ in events]
+    assert kinds.index("patch_rejected") < kinds.index("correction_turn") < kinds.index("patch_submitted")
+
+    blocks = _last_user_blocks(model, 2)
+    assert blocks[0]["type"] == "tool_result" and blocks[0]["is_error"]
+    assert "correction turn 1 of 2" in blocks[-1]["text"]
+
+
+def test_correction_turns_are_bounded(ready_run, session_factory):
+    config = agent_settings(agent_max_turns=1, agent_max_patch_repair_turns=2)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s1")]),
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s2")]),
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s3")]),
+        make_turn(tool_calls=[submit_call(call_id="s4")]),  # never reached
+    ])
+    assert propose(ready_run, session_factory, model, FakeGitHub(), config) == worker.EXIT_ATTEMPT_FAILED
+
+    attempt, _, run_status = attempt_of(session_factory, ready_run)
+    assert attempt.error_kind == "turn_budget_exceeded"
+    assert "2 correction turn(s)" in attempt.error_message
+    assert attempt.diff is None
+    assert model.calls == 3
+    assert run_status == RUN_STATUS_READY
+
+
+def test_reads_are_refused_in_a_correction_turn(ready_run, session_factory):
+    config = agent_settings(agent_max_turns=1, agent_max_patch_repair_turns=2)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s1")]),
+        make_turn(tool_calls=[read_call("a.py", "r1"), read_call("b.py", "r2")]),
+        make_turn(tool_calls=[submit_call(call_id="s2")]),
+    ])
+    github = FakeGitHub(files={"a.py": "1\n", "b.py": "2\n"})
+    assert propose(ready_run, session_factory, model, github, config) == worker.EXIT_OK
+
+    # Nothing was fetched, and both call ids were answered with an error.
+    assert not [p for p in github.paths if p.startswith("/repos/o/r/contents/")]
+    refused = [b for b in _last_user_blocks(model, 2) if b["type"] == "tool_result"]
+    assert {b["tool_use_id"] for b in refused} == {"r1", "r2"}
+    assert all(b["is_error"] for b in refused)
+    _, events, _ = attempt_of(session_factory, ready_run)
+    assert any(kind == "correction_refused" for _, kind, _ in events)
+
+
+def test_reading_after_a_rejection_forfeits_correction_turns(ready_run, session_factory):
+    """Only a rejected submission on the most recent turn earns correction turns."""
+    config = agent_settings(agent_max_turns=2, agent_max_patch_repair_turns=2)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s1")]),
+        make_turn(tool_calls=[read_call("a.py")]),
+        make_turn(tool_calls=[submit_call(call_id="s2")]),  # never reached
+    ])
+    github = FakeGitHub(files={"a.py": "1\n"})
+    assert propose(ready_run, session_factory, model, github, config) == worker.EXIT_ATTEMPT_FAILED
+    attempt, _, _ = attempt_of(session_factory, ready_run)
+    assert attempt.error_kind == "turn_budget_exceeded"
+    assert model.calls == 2
+
+
+def test_correction_turns_can_be_disabled(ready_run, session_factory):
+    config = agent_settings(agent_max_turns=1, agent_max_patch_repair_turns=0)
+    model = ScriptedModelClient([
+        make_turn(tool_calls=[submit_call(diff=BAD_DIFF, call_id="s1")]),
+        make_turn(tool_calls=[submit_call(call_id="s2")]),  # never reached
+    ])
+    assert propose(ready_run, session_factory, model, FakeGitHub(), config) == worker.EXIT_ATTEMPT_FAILED
+    attempt, _, _ = attempt_of(session_factory, ready_run)
+    assert attempt.error_kind == "turn_budget_exceeded"
+    assert "no correction turns are configured" in attempt.error_message
+    assert model.calls == 1
+    assert "correction turn" not in model.seen_messages[0][0]["content"]
+
+
 def test_tool_call_budget_exhausted(ready_run, session_factory):
     config = agent_settings(agent_max_tool_calls=1, agent_max_turns=6)
     model = ScriptedModelClient([
