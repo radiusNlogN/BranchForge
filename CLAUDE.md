@@ -166,7 +166,7 @@ uv run alembic current
 
 ### Test suite shape
 
-400 tests: 377 offline, the 17 marked `docker` (15 runner/verifier scenarios plus 2
+408 tests: 385 offline, the 17 marked `docker` (15 runner/verifier scenarios plus 2
 real-container orchestrations in `tests/test_docker_orchestration.py`), and the 6 marked `browser`,
 which drive a real Chromium through the dashboard.
 
@@ -398,6 +398,18 @@ the Python side must validate and dispatch every tool call. Invariants to preser
 - **A `max_tokens` response is rejected before its tool calls run** — the arguments may be truncated.
 - **Never mark an incomplete conversation successful.** Budget exhaustion, provider failure, refusal,
   and "ended without a patch" are all recorded failures with their own `error_kind`.
+- **A patch rejected on the final turn can still be corrected.** When the turn budget runs out and the
+  most recent turn was a rejected submission (`patch_rejected` or `batch_rejected`), up to
+  `AGENT_MAX_PATCH_REPAIR_TURNS` correction turns follow in which only `submit_patch` is accepted;
+  reads are refused with one `is_error` result per id and fetch nothing. A read batch clears the
+  eligibility, so correction turns never become a way to keep investigating. Exhausting them is still
+  `turn_budget_exceeded`.
+- **The model is told its budget.** The first message carries a `## Budget` section (before any
+  emphasis, so siblings still differ only in that final section), and a notice is attached before the
+  final turn and each correction turn. The notice is a **separate `text` block after the tool
+  results** of the not-yet-sent user message — never inside a tool result, so repository content
+  cannot imitate it, and the history stays append-only. It is deliberately not a `role: "system"`
+  message: `ANTHROPIC_MODEL` may name a model (e.g. Sonnet 5) that rejects those with a 400.
 - **Context is measured, never estimated**: `count_input_tokens` (behind the model interface, so
   tests need no network) is called before every generation with system + tools + full history. Over
   budget ⇒ terminate with an explanation. **Never drop or summarize messages** — compaction is a

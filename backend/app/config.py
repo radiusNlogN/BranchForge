@@ -91,6 +91,11 @@ class Settings(BaseSettings):
 
     agent_max_turns: int = 8
     agent_max_tool_calls: int = 12
+    # When the turn budget runs out and the most recent turn was a rejected
+    # submission, this many extra turns follow in which only `submit_patch` is
+    # accepted. Without them, a patch rejected on the final turn could never be
+    # corrected even though validation told the model exactly what was wrong.
+    agent_max_patch_repair_turns: int = Field(default=2, ge=0)
 
     agent_max_file_bytes: int = 60_000
     agent_max_total_fetched_bytes: int = 200_000

@@ -1372,6 +1372,7 @@ textarea:disabled {
 .events__kind--tool_error,
 .events__kind--patch_rejected,
 .events__kind--batch_rejected,
+.events__kind--correction_refused,
 .events__kind--tool_unknown { color: var(--danger); }
 
 .events__summary {

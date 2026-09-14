@@ -776,6 +776,7 @@ the attempt:
 |---|---|---|
 | `AGENT_MAX_TURNS` | 8 | Model round-trips per attempt |
 | `AGENT_MAX_TOOL_CALLS` | 12 | Tool calls per attempt |
+| `AGENT_MAX_PATCH_REPAIR_TURNS` | 2 | Extra submit-only turns after a patch is rejected on the final turn (`0` disables) |
 | `AGENT_MAX_FILE_BYTES` | 60,000 | One `read_file` |
 | `AGENT_MAX_TOTAL_FETCHED_BYTES` | 200,000 | All reads combined |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16,000 | Output per model call |
