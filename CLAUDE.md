@@ -726,9 +726,15 @@ view-only and must set `DISPATCHER_AVAILABLE=false`.
 `DISPATCHER_AVAILABLE` (default `true`) is configuration, never a probe. When `false`, `POST /start`
 answers 409 *after* returning any existing job (the same ordering rule as eligibility), `/api/health`
 reports it, and the dashboard hides Start, never polls, and replaces NotImplementedNote's "start the
-whole workflow from this page" paragraph — that sentence is false on such a deployment. `vercel.json`
-deploys exactly this shape (backend service entrypoint `app/main.py`; the frontend built with an empty
-`VITE_API_BASE_URL` so it calls `/api` on its own origin).
+whole workflow from this page" paragraph — that sentence is false on such a deployment.
+
+`vercel.json` deploys **only the frontend** (built with an empty `VITE_API_BASE_URL`, so it calls
+`/api` on its own origin) and rewrites `/api/:path*` to the `deploy/` VM
+(`https://34-61-91-141.sslip.io`), where the API and dispatcher share SQLite behind Caddy's Basic Auth.
+The rewrite is what keeps this same-origin: pointing `VITE_API_BASE_URL` at the VM instead would make
+every request cross-origin, and Basic Auth breaks that (preflights carry no credentials, and `api.ts`
+does not send them cross-origin). The VM's hostname must have a publicly trusted certificate — a bare
+IP gets Caddy's internal CA, which the rewrite cannot use.
 
 `CORS_ORIGINS` is a comma-separated string parsed by
 `Settings.cors_origin_list` — it is stored as a string rather than a list because pydantic-settings
